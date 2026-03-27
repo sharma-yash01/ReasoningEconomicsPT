@@ -1,1 +1,1 @@
-"""Training: GRPO training loop for post-training LLMs on ReasonBudgetEnvironment."""
+"""Training: GRPO loop for post-training LLMs via remote OpenEnv client."""
