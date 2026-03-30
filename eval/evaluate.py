@@ -1,4 +1,4 @@
-"""Run all baselines over N episodes; collect metrics (v2: text-response actions)."""
+"""Run all baselines over N episodes against remote env; collect metrics."""
 
 import argparse
 import json
@@ -7,26 +7,22 @@ from typing import Any
 
 import numpy as np
 
-from env import EnvConfig, ReasonBudgetEnvironment
-from env.models import ReasonBudgetAction
-from baselines import (
+from eval.baselines import (
     APIChatBaseline,
     DifficultyOracleBaseline,
     GreedyMaxBaseline,
     LocalVLLMBaseline,
     UniformBaseline,
 )
+from training.openenv_runtime import ReasonBudgetClient, to_openenv_base_url
 
 
 def _select_response(
-    env: ReasonBudgetEnvironment,
-    obs,
+    obs: dict,
     baseline: Any,
     max_new_tokens: int | None = None,
-) -> str:
-    ptype = None
-    if hasattr(env, "_questions") and env._questions and env._step_idx < len(env._questions):
-        ptype = env._questions[env._step_idx].problem_type
+):
+    ptype = obs.get("metadata", {}).get("problem_type")
     return baseline.select_action(
         obs,
         problem_type=ptype,
@@ -34,7 +30,7 @@ def _select_response(
     )
 
 
-def _parse_csv_names(value: str | None) -> list[str]:
+def _parse_csv_names(value: str | None):
     if not value:
         return []
     return [x.strip() for x in value.split(",") if x.strip()]
@@ -45,7 +41,7 @@ def _build_baselines(
     *,
     min_tokens: int,
     max_tokens: int,
-) -> dict[str, Any]:
+):
     baselines: dict[str, Any] = {
         "uniform": UniformBaseline(min_tokens, max_tokens),
         "greedy_max": GreedyMaxBaseline(min_tokens, max_tokens),
@@ -80,40 +76,42 @@ def _build_baselines(
 
 
 def evaluate_baseline(
-    env: ReasonBudgetEnvironment,
+    env_client,
     baseline,
     n_episodes: int,
     seed: int,
     llm_max_new_tokens: int | None = None,
-) -> list[dict]:
+):
     results = []
     for ep in range(n_episodes):
-        obs = env.reset(seed=seed + ep)
+        result = env_client.reset(seed=seed + ep)
+        obs = result.observation
         total_reward = 0.0
         tokens_per_step: list[int] = []
-        while not obs.done:
+        while not obs.get("done", False):
             response = _select_response(
-                env,
                 obs,
                 baseline,
                 max_new_tokens=llm_max_new_tokens,
             )
-            obs = env.step(ReasonBudgetAction(response=response))
-            total_reward += float(obs.reward or 0.0)
-            if obs.history:
-                tokens_per_step.append(obs.history[-1].get("tokens_used", 0))
-        state = env.state
-        spent = int(state.spent_budget)
-        budget = int(state.total_budget)
+            result = env_client.step({"response": response})
+            obs = result.observation
+            total_reward += float(result.reward or 0.0)
+            history = obs.get("history", [])
+            if history:
+                tokens_per_step.append(history[-1].get("tokens_used", 0))
+        state = env_client.state()
+        spent = int(state.get("spent_budget", 0))
+        budget = int(state.get("total_budget", 0))
         budget_util = (spent / budget) if budget > 0 else 0.0
         overspend_tokens = max(0, spent - budget)
         results.append({
             "total_reward": total_reward,
-            "total_correct": state.total_correct,
-            "questions_answered": state.questions_answered,
+            "total_correct": state.get("total_correct", 0),
+            "questions_answered": state.get("questions_answered", 0),
             "accuracy": (
-                state.total_correct / state.questions_answered
-                if state.questions_answered
+                state.get("total_correct", 0) / state.get("questions_answered", 1)
+                if state.get("questions_answered", 0)
                 else 0
             ),
             "budget_utilization": budget_util,
@@ -128,11 +126,13 @@ def evaluate_baseline(
     return results
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n_episodes", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="eval_results.json")
+    parser.add_argument("--env_base_url", type=str, default=None)
+    parser.add_argument("--space_url", type=str, default=None)
     parser.add_argument(
         "--include_llm",
         action="store_true",
@@ -150,27 +150,34 @@ def main() -> None:
     parser.add_argument("--llm_temperature", type=float, default=0.0)
     args = parser.parse_args()
 
-    config = EnvConfig(num_questions=10, budget_ratio=2.0, seed=args.seed)
-    env = ReasonBudgetEnvironment(config=config)
-
-    min_tokens = config.min_tokens
-    max_tokens = config.max_tokens
-    all_results: dict[str, list[dict]] = {}
-    selected_baselines = _build_baselines(
-        args,
-        min_tokens=min_tokens,
-        max_tokens=max_tokens,
+    env_base_url = to_openenv_base_url(
+        env_base_url=args.env_base_url,
+        space_url=args.space_url,
     )
 
-    for name, baseline in selected_baselines.items():
-        res = evaluate_baseline(
-            env,
-            baseline,
-            args.n_episodes,
-            args.seed,
-            llm_max_new_tokens=args.llm_max_new_tokens,
+    with ReasonBudgetClient(base_url=env_base_url).sync() as env_client:
+        # Probe config from the first reset observation metadata
+        probe = env_client.reset(seed=args.seed)
+        probe_meta = probe.observation.get("metadata", {})
+        min_tokens = probe_meta.get("min_tokens", 10)
+        max_tokens = probe_meta.get("max_tokens", 800)
+
+        all_results: dict[str, list[dict]] = {}
+        selected_baselines = _build_baselines(
+            args,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
         )
-        all_results[name] = res
+
+        for name, baseline in selected_baselines.items():
+            res = evaluate_baseline(
+                env_client,
+                baseline,
+                args.n_episodes,
+                args.seed,
+                llm_max_new_tokens=args.llm_max_new_tokens,
+            )
+            all_results[name] = res
 
     summary = {}
     for agent, runs in all_results.items():
@@ -194,7 +201,6 @@ def main() -> None:
         }
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Strip tokens_per_step from raw output to keep file manageable
     raw_compact = {}
     for agent, runs in all_results.items():
         raw_compact[agent] = [

@@ -9,14 +9,14 @@
 
 set -euo pipefail
 
-# Required exports (can also be set in shell before sbatch):
+# Required exports (set in shell before sbatch, or in submit_grpo_carc.sh):
 #   REPT_ROOT                absolute path to ReasoningEconomicsPT on CARC
 #   REPT_VENV                absolute path to Python venv with dependencies installed
 #   ENV_BASE_URL             OpenEnv space URL (https://owner-space.hf.space)
 #
 # Optional exports:
 #   REPT_MODEL               default: Qwen/Qwen2.5-0.5B-Instruct
-#   REPT_OUTPUT_DIR          default: runs/grpo_train_carc
+#   REPT_OUTPUT_DIR          default: /scratch1/$USER/rept/runs/grpo_train_carc
 #   REPT_NUM_EPOCHS          default: 1
 #   REPT_NUM_GENERATIONS     default: 8
 #   REPT_BATCH_SIZE          default: 2
@@ -32,7 +32,7 @@ set -euo pipefail
 : "${ENV_BASE_URL:?ENV_BASE_URL is required}"
 
 REPT_MODEL="${REPT_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
-REPT_OUTPUT_DIR="${REPT_OUTPUT_DIR:-runs/grpo_train_carc}"
+REPT_OUTPUT_DIR="${REPT_OUTPUT_DIR:-/scratch1/$USER/rept/runs/grpo_train_carc}"
 REPT_NUM_EPOCHS="${REPT_NUM_EPOCHS:-1}"
 REPT_NUM_GENERATIONS="${REPT_NUM_GENERATIONS:-8}"
 REPT_BATCH_SIZE="${REPT_BATCH_SIZE:-2}"
@@ -43,16 +43,42 @@ REPT_ALPHA="${REPT_ALPHA:-1.0}"
 REPT_BETA="${REPT_BETA:-0.0}"
 REPT_LOG_EVERY="${REPT_LOG_EVERY:-1}"
 
+SCRATCH_CACHE="/scratch1/$USER/cache"
+
+# ------------------------------------------------------------------ modules
+# gcc/12.3.0: loadable on Discovery2 without legacy/CentOS7 (gcc/11.3.0 requires that stack).
+echo ">>> Loading modules..."
+module purge
+module load gcc/13.3.0
+module load python/3.11.9
+module load cuda/12.6.3
+echo "    Loaded: gcc/13.3.0, python/3.11.9, cuda/12.6.3"
+# ------------------------------------------------------------------ venv
 cd "$REPT_ROOT"
 mkdir -p logs
-
-# If your CARC setup requires modules, load them before activating venv.
-# module purge
-# module load python/3.11
-# module load cuda/12.1
-
 source "$REPT_VENV/bin/activate"
 
+# ------------------------------------------------------------------ runtime caches on scratch
+mkdir -p "$SCRATCH_CACHE/huggingface" "$SCRATCH_CACHE/tmp" "$REPT_OUTPUT_DIR"
+export HF_HOME="$SCRATCH_CACHE/huggingface"
+export TRANSFORMERS_CACHE="$SCRATCH_CACHE/huggingface/transformers"
+export TMPDIR="$SCRATCH_CACHE/tmp"
+
+# ------------------------------------------------------------------ diagnostics
+echo "=== REPT GRPO Training ==="
+echo "  Job ID:      ${SLURM_JOB_ID:-local}"
+echo "  Node:        $(hostname)"
+echo "  GPU:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'n/a')"
+echo "  Python:      $(python --version)"
+echo "  Torch:       $(python -c 'import torch; print(torch.__version__)')"
+echo "  CUDA avail:  $(python -c 'import torch; print(torch.cuda.is_available())')"
+echo "  Model:       $REPT_MODEL"
+echo "  Output dir:  $REPT_OUTPUT_DIR"
+echo "  Env URL:     $ENV_BASE_URL"
+echo "  Budget mode: $REPT_DEFAULT_BUDGET_MODE"
+echo "=========================="
+
+# ------------------------------------------------------------------ training
 python -m training.grpo_train \
   --model "$REPT_MODEL" \
   --env_base_url "$ENV_BASE_URL" \
@@ -66,3 +92,5 @@ python -m training.grpo_train \
   --gradient_accumulation_steps "$REPT_GRAD_ACCUM" \
   --vllm_mode "$REPT_VLLM_MODE" \
   --output_dir "$REPT_OUTPUT_DIR"
+
+echo "=== Training complete. Artifacts at: $REPT_OUTPUT_DIR ==="

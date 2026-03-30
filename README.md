@@ -78,6 +78,103 @@ Disable logs with:
 python -m training.grpo_train --no_log_rewards ...
 ```
 
+## USC CARC (Discovery) -- Full Workflow
+
+All outputs (model checkpoints, reward logs, caches) go to `/scratch1/` to avoid home-dir quota exhaustion.
+
+### 1. One-time bootstrap
+
+SSH into a CARC login node and run:
+
+```bash
+# Clone or copy ReasoningEconomicsPT to scratch
+export REPT_ROOT=/scratch1/$USER/rept/ReasoningEconomicsPT
+export REPT_VENV=/scratch1/$USER/rept/rept-venv
+
+# (Optional) install env client from HF Space artifact
+export ENV_CLIENT_INSTALL="git+https://huggingface.co/spaces/<owner>/<space_repo>"
+# Or for local dev:
+# export ENV_CLIENT_INSTALL="-e /scratch1/$USER/rept/ReasoningEconomicsEnv"
+
+cd "$REPT_ROOT"
+bash scripts/bootstrap_carc_env.sh
+```
+
+This loads modules (`gcc/12.3.0`, `python/3.11.6`, `cuda/12.1.1`), creates a venv, installs all pinned dependencies from `requirements.carc-cu121.txt`, and runs a smoke import test. (`gcc/11.3.0` on Discovery2 requires `legacy/CentOS7` first; `gcc/12.3.0` loads directly.)
+
+### 2. Pre-submission check
+
+```bash
+export REPT_ROOT=/scratch1/$USER/rept/ReasoningEconomicsPT
+export REPT_VENV=/scratch1/$USER/rept/rept-venv
+export ENV_BASE_URL="https://<owner>-<space_repo>.hf.space"
+export REPT_OUTPUT_DIR=/scratch1/$USER/rept/runs/grpo_train_carc
+
+bash scripts/preflight_carc.sh
+```
+
+Fails fast on missing vars, broken venv, unreachable endpoint, or non-scratch output path.
+
+### 3. Submit training job
+
+```bash
+# Dry run (print config, no submission):
+bash scripts/submit_grpo_carc.sh --dry-run
+
+# Actual submission:
+bash scripts/submit_grpo_carc.sh
+```
+
+Override defaults via exports before submitting:
+
+```bash
+export REPT_MODEL="Qwen/Qwen2.5-0.5B-Instruct"
+export REPT_NUM_EPOCHS=1
+export REPT_NUM_GENERATIONS=8
+export REPT_BATCH_SIZE=2
+export REPT_GRAD_ACCUM=8
+export REPT_VLLM_MODE=colocate
+export REPT_DEFAULT_BUDGET_MODE=hard
+export REPT_ALPHA=1.0
+export REPT_BETA=0.0
+```
+
+### 4. Monitor
+
+```bash
+# Check job status
+squeue -u "$USER"
+scontrol show job <JOBID>
+sacct -u "$USER" -S today --format=JobID,JobName%25,Partition,State,Elapsed,ExitCode
+
+# Tail training log
+tail -f logs/rept-grpo-<JOBID>.out
+```
+
+### 5. Artifact locations
+
+After training completes, outputs are at:
+
+| Artifact | Path |
+|---|---|
+| Model + checkpoints | `$REPT_OUTPUT_DIR/` (e.g. `/scratch1/$USER/rept/runs/grpo_train_carc/`) |
+| Reward JSONL log | `$REPT_OUTPUT_DIR/reward_logs.jsonl` |
+| Slurm stdout log | `$REPT_ROOT/logs/rept-grpo-<JOBID>.out` |
+| HF cache | `/scratch1/$USER/cache/huggingface/` |
+
+### CARC module versions
+
+The scripts load these modules explicitly:
+
+- `gcc/12.3.0`
+- `python/3.11.6`
+- `cuda/12.1.1`
+
+### Dependency pinning
+
+- `requirements.txt` -- platform-agnostic pinned deps (exact `==` versions).
+- `requirements.carc-cu121.txt` -- CARC-specific lock file; install with `--extra-index-url https://download.pytorch.org/whl/cu121`.
+
 ## Notes
 
 - Training uses remote OpenEnv `reset/step` calls instead of importing `ReasonBudgetEnvironment` in-process.

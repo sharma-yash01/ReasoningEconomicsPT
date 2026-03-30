@@ -7,7 +7,7 @@ from typing import Any
 
 from training.config import TrainingRuntimeConfig
 from training.openenv_runtime import (
-    load_reason_budget_symbols,
+    ReasonBudgetClient,
     resolve_budget_mode_from_observation,
     to_openenv_base_url,
 )
@@ -23,12 +23,12 @@ SYSTEM_PROMPT = (
 )
 
 
-def format_observation_prompt(obs: Any):
+def format_observation_prompt(obs: dict):
     """Format an environment observation into a natural language prompt for the LLM."""
-    history_lines = ""
-    if obs.history:
+    history = obs.get("history", [])
+    if history:
         entries = []
-        for i, h in enumerate(obs.history, 1):
+        for i, h in enumerate(history, 1):
             status = "correct" if h.get("was_correct") else "wrong"
             tokens = h.get("tokens_used", "?")
             summary = h.get("question_summary", "")
@@ -38,12 +38,12 @@ def format_observation_prompt(obs: Any):
         history_lines = "  (none yet)"
 
     return (
-        f"Remaining budget: {int(obs.remaining_budget)} tokens\n"
-        f"Questions remaining: {obs.questions_remaining} (including this one)\n"
-        f"Budget per remaining question: {obs.budget_per_remaining:.0f} tokens\n"
-        f"Your accuracy so far: {obs.accuracy_so_far:.0%}\n"
+        f"Remaining budget: {int(obs['remaining_budget'])} tokens\n"
+        f"Questions remaining: {obs['questions_remaining']} (including this one)\n"
+        f"Budget per remaining question: {obs['budget_per_remaining']:.0f} tokens\n"
+        f"Your accuracy so far: {obs['accuracy_so_far']:.0%}\n"
         f"\nPrevious questions:\n{history_lines}\n"
-        f"\nCurrent question:\n{obs.question}\n"
+        f"\nCurrent question:\n{obs['question']}\n"
         f"\nSolve this problem. Show your reasoning, then give your final answer in \\boxed{{}}."
     )
 
@@ -68,7 +68,6 @@ def reward_from_env(completions: list, **kwargs: Any):
 
 def build_rollout_func(*, env_base_url: str, runtime_cfg: TrainingRuntimeConfig, output_dir: str):
     """Build rollout function bound to target OpenEnv endpoint."""
-    env_client_cls, action_cls, _obs_cls = load_reason_budget_symbols()
     reward_log_path = runtime_cfg.resolved_reward_log_path(output_dir)
     reward_log_file = Path(reward_log_path)
     reward_log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +95,7 @@ def build_rollout_func(*, env_base_url: str, runtime_cfg: TrainingRuntimeConfig,
         all_logprobs: list = []
         all_rewards: list[float] = []
 
-        with env_client_cls(base_url=env_base_url).sync() as env_client:
+        with ReasonBudgetClient(base_url=env_base_url).sync() as env_client:
             for episode_idx, _prompt in enumerate(prompts):
                 result = env_client.reset()
                 obs = result.observation
@@ -112,7 +111,7 @@ def build_rollout_func(*, env_base_url: str, runtime_cfg: TrainingRuntimeConfig,
                         default_mode=runtime_cfg.normalized_default_mode(),
                         strict=runtime_cfg.strict_budget_mode_metadata,
                     )
-                    remaining_budget = int(getattr(obs, "remaining_budget", 0))
+                    remaining_budget = int(obs.get("remaining_budget", 0))
                     if budget_mode == "hard":
                         max_new_tokens = min(
                             runtime_cfg.max_tokens_per_step,
@@ -135,7 +134,7 @@ def build_rollout_func(*, env_base_url: str, runtime_cfg: TrainingRuntimeConfig,
                         outputs["completion_ids"], skip_special_tokens=True
                     )
 
-                    result = env_client.step(action_cls(response=completion_text))
+                    result = env_client.step({"response": completion_text})
                     obs = result.observation
                     done = bool(result.done)
                     total_signal = float(result.reward or 0.0)
