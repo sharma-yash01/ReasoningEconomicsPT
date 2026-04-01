@@ -1,12 +1,12 @@
 # ---- Core training stack (pinned for reproducibility) ----
 openenv-core[core]==0.2.*
-trl>=0.14,<0.29
-transformers>=4.46,<4.50
-datasets>=2.21,<3.0
-accelerate>=1.2,<1.4
+trl==1.0.0
+transformers>=5.2.0
+datasets>=2.21
+accelerate>=1.2
 
 # ---- Inference / generation ----
-vllm==0.6.6.post1
+vllm>=0.10.2,<0.15
 
 # ---- Deep learning runtime ----
 torch==2.5.*

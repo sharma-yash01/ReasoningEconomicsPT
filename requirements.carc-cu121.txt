@@ -4,18 +4,18 @@
 #       --extra-index-url https://download.pytorch.org/whl/cu121
 
 # ---- Deep learning runtime (CUDA 12.1 wheels) ----
-torch==2.5.*
-numpy==1.26.*
+torch==2.8.*
+numpy>=1.26
 
 # ---- Inference / generation ----
-vllm==0.6.6.post1
+vllm==0.10.2
 
 # ---- Core training stack ----
 openenv-core[core]==0.2.*
-trl>=0.14,<0.29
-transformers>=4.46,<4.50
-datasets>=2.21,<3.0
-accelerate>=1.2,<1.4
+trl==1.0.0
+transformers>=5.2.0
+datasets>=4.7.0
+accelerate>=1.4.0 
 
 # ---- Data / config ----
-pydantic==2.10.*
+pydantic>=2.11.7

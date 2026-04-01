@@ -8,17 +8,25 @@ from pathlib import Path
 
 @dataclass
 class TrainingRuntimeConfig:
-    """Runtime controls used by training/grpo_train.py."""
+    """Runtime controls used by training/grpo_train.py.
+
+    After migrating to environment_factory, only ``alpha`` and the reward-
+    logging fields are actively used by grpo_train.  The remaining fields
+    are kept for backward compatibility with other consumers (e.g.
+    openenv_runtime.resolve_budget_mode_from_observation).
+    """
 
     # Reward weighting (total signal path for now).
     alpha: float = 1.0
-    beta: float = 0.0
+    beta: float = 0.0  # unused by environment_factory path
 
-    # Token generation controls.
+    # Token generation controls -- unused after environment_factory migration;
+    # the trainer now controls generation length via max_completion_length.
     max_tokens_per_step: int = 2048
     min_tokens_per_step: int = 10
 
-    # Mode detection controls.
+    # Mode detection controls -- unused after environment_factory migration;
+    # the env server enforces hard-cap mode directly.
     default_budget_mode: str = "hard"
     strict_budget_mode_metadata: bool = False
 

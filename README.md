@@ -10,7 +10,7 @@ Install core training dependencies:
 pip install -r requirements.txt
 ```
 
-### Production (recommended on CARC/hyperscalers)
+### Production (recommended on hyperscalers)
 
 Install the environment client artifact from your Hugging Face Space:
 
@@ -30,16 +30,18 @@ export ENV_BASE_URL="https://<owner>-<space_repo>.hf.space"
 pip install -e "../ReasoningEconomicsEnv"
 ```
 
-## Run GRPO training
+## Run GRPO training (direct)
 
 ```bash
 python -m training.grpo_train \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --env_base_url "$ENV_BASE_URL" \
   --alpha 1.0 \
-  --beta 0.0 \
-  --default_budget_mode hard \
   --num_train_epochs 1 \
+  --num_generations 8 \
+  --per_device_train_batch_size 2 \
+  --gradient_accumulation_steps 8 \
+  --vllm_mode colocate \
   --output_dir runs/grpo_train
 ```
 
@@ -50,35 +52,97 @@ python -m training.grpo_train \
   --space_url "https://huggingface.co/spaces/<owner>/<space_repo>"
 ```
 
-## Metadata contract for token-cap mode
+## Lambda Labs On-Demand -- Recommended Workflow
 
-`grpo_train.py` reads `observation.metadata["budget_mode"]` each step:
+Use this path for single-node GRPO training on a Lambda GPU VM. It replaces CARC-specific Slurm/module flow with direct shell scripts.
 
-- `hard`: cap generation by remaining budget (plus minimum floor).
-- `soft`: use `max_tokens_per_step` without remaining-budget cap.
-
-If metadata is missing, training falls back to `--default_budget_mode` unless `--strict_budget_mode_metadata` is set.
-
-## Reward topology used in PT (current)
-
-- PT trains on the **incoming total reward signal** from the environment (`StepResult.reward`).
-- In prod env behavior, terminal-step reward already includes episode bonus.
-- `alpha` scales total signal; `beta` is reserved for future decomposed reward wiring.
-
-## Reward logging
-
-By default, reward logs are emitted:
-
-- Console logs every `--log_every_n_steps`.
-- JSONL file at `runs/<output_dir>/reward_logs.jsonl` (or `--reward_log_path`).
-
-Disable logs with:
+### 1. One-time bootstrap
 
 ```bash
-python -m training.grpo_train --no_log_rewards ...
+export REPT_ROOT=/home/ubuntu/ReasoningEconomicsPT
+export REPT_VENV=/home/ubuntu/.venvs/rept-lambda
+export REPT_FS_NAME=<lambda-filesystem-name>
+export REPT_DATA_ROOT=/lambda/nfs/$REPT_FS_NAME/rept
+export ENV_BASE_URL="https://<owner>-<space_repo>.hf.space"
+
+cd "$REPT_ROOT"
+bash scripts/bootstrap_lambda.sh
 ```
 
-## USC CARC (Discovery) -- Full Workflow
+Notes:
+
+- `bootstrap_lambda.sh` installs from `requirements.txt` by default.
+- If CUDA wheel compatibility needs an override, set:
+
+```bash
+export REPT_REQUIREMENTS_FILE="$REPT_ROOT/requirements.txt"
+export PYTORCH_WHEEL_INDEX="https://download.pytorch.org/whl/cu121"
+```
+
+### 2. Preflight checks
+
+```bash
+bash scripts/preflight_lambda.sh
+```
+
+This validates env vars, venv health, imports, GPU visibility, `torch.cuda.is_available()`, endpoint reachability, and output path placement.
+
+### 3. Launch training
+
+```bash
+export REPT_OUTPUT_DIR=/lambda/nfs/$REPT_FS_NAME/rept/runs/grpo_train_lambda
+
+# Optional dry run:
+bash scripts/run_grpo_lambda.sh --dry-run
+
+# Actual run:
+bash scripts/run_grpo_lambda.sh
+```
+
+Override defaults via exports before launch:
+
+```bash
+export REPT_MODEL="Qwen/Qwen2.5-0.5B-Instruct"
+export REPT_NUM_EPOCHS=1
+export REPT_NUM_GENERATIONS=8
+export REPT_BATCH_SIZE=2
+export REPT_GRAD_ACCUM=8
+export REPT_VLLM_MODE=colocate
+export REPT_ALPHA=1.0
+export REPT_LOG_EVERY=1
+```
+
+### 4. Optional local env server on the same Lambda VM
+
+If you want to avoid remote endpoint dependency, run the env server locally and point training at localhost:
+
+```bash
+cd /home/ubuntu/ReasoningEconomicsEnv
+python -m server.app
+
+# In another shell:
+export ENV_BASE_URL="http://127.0.0.1:8000"
+```
+
+### 5. Smoke validation checklist
+
+For a quick end-to-end check before long runs:
+
+```bash
+export REPT_NUM_EPOCHS=1
+export REPT_NUM_GENERATIONS=2
+export REPT_BATCH_SIZE=1
+export REPT_GRAD_ACCUM=1
+bash scripts/run_grpo_lambda.sh
+```
+
+Confirm:
+
+- Checkpoints and trainer outputs appear under `$REPT_OUTPUT_DIR`.
+- Reward logs appear in `$REPT_OUTPUT_DIR/reward_logs.jsonl`.
+- Caches are under `$REPT_DATA_ROOT/cache` (`HF_HOME`, `TRANSFORMERS_CACHE`, `PIP_CACHE_DIR`).
+
+## USC CARC (Discovery) -- Existing Workflow
 
 All outputs (model checkpoints, reward logs, caches) go to `/scratch1/` to avoid home-dir quota exhaustion.
 
@@ -87,20 +151,14 @@ All outputs (model checkpoints, reward logs, caches) go to `/scratch1/` to avoid
 SSH into a CARC login node and run:
 
 ```bash
-# Clone or copy ReasoningEconomicsPT to scratch
 export REPT_ROOT=/scratch1/$USER/rept/ReasoningEconomicsPT
 export REPT_VENV=/scratch1/$USER/rept/rept-venv
-
-# (Optional) install env client from HF Space artifact
-export ENV_CLIENT_INSTALL="git+https://huggingface.co/spaces/<owner>/<space_repo>"
-# Or for local dev:
-# export ENV_CLIENT_INSTALL="-e /scratch1/$USER/rept/ReasoningEconomicsEnv"
 
 cd "$REPT_ROOT"
 bash scripts/bootstrap_carc_env.sh
 ```
 
-This loads modules (`gcc/12.3.0`, `python/3.11.6`, `cuda/12.1.1`), creates a venv, installs all pinned dependencies from `requirements.carc-cu121.txt`, and runs a smoke import test. (`gcc/11.3.0` on Discovery2 requires `legacy/CentOS7` first; `gcc/12.3.0` loads directly.)
+This loads modules (`gcc/13.3.0`, `python/3.11.9`, `cuda/12.6.3`), creates a venv, installs pinned CARC dependencies, and runs a smoke import test.
 
 ### 2. Pre-submission check
 
@@ -113,8 +171,6 @@ export REPT_OUTPUT_DIR=/scratch1/$USER/rept/runs/grpo_train_carc
 bash scripts/preflight_carc.sh
 ```
 
-Fails fast on missing vars, broken venv, unreachable endpoint, or non-scratch output path.
-
 ### 3. Submit training job
 
 ```bash
@@ -125,57 +181,14 @@ bash scripts/submit_grpo_carc.sh --dry-run
 bash scripts/submit_grpo_carc.sh
 ```
 
-Override defaults via exports before submitting:
+## Dependency files
 
-```bash
-export REPT_MODEL="Qwen/Qwen2.5-0.5B-Instruct"
-export REPT_NUM_EPOCHS=1
-export REPT_NUM_GENERATIONS=8
-export REPT_BATCH_SIZE=2
-export REPT_GRAD_ACCUM=8
-export REPT_VLLM_MODE=colocate
-export REPT_DEFAULT_BUDGET_MODE=hard
-export REPT_ALPHA=1.0
-export REPT_BETA=0.0
-```
+- `requirements.txt` -- default training dependencies, used by Lambda scripts.
+- `requirements.carc-cu121.txt` -- CARC-specific lock file for Discovery CUDA stack.
 
-### 4. Monitor
-
-```bash
-# Check job status
-squeue -u "$USER"
-scontrol show job <JOBID>
-sacct -u "$USER" -S today --format=JobID,JobName%25,Partition,State,Elapsed,ExitCode
-
-# Tail training log
-tail -f logs/rept-grpo-<JOBID>.out
-```
-
-### 5. Artifact locations
-
-After training completes, outputs are at:
-
-| Artifact | Path |
-|---|---|
-| Model + checkpoints | `$REPT_OUTPUT_DIR/` (e.g. `/scratch1/$USER/rept/runs/grpo_train_carc/`) |
-| Reward JSONL log | `$REPT_OUTPUT_DIR/reward_logs.jsonl` |
-| Slurm stdout log | `$REPT_ROOT/logs/rept-grpo-<JOBID>.out` |
-| HF cache | `/scratch1/$USER/cache/huggingface/` |
-
-### CARC module versions
-
-The scripts load these modules explicitly:
-
-- `gcc/12.3.0`
-- `python/3.11.6`
-- `cuda/12.1.1`
-
-### Dependency pinning
-
-- `requirements.txt` -- platform-agnostic pinned deps (exact `==` versions).
-- `requirements.carc-cu121.txt` -- CARC-specific lock file; install with `--extra-index-url https://download.pytorch.org/whl/cu121`.
+If Lambda wheel compatibility requires different pins, add a dedicated `requirements.lambda.txt` instead of modifying the CARC file.
 
 ## Notes
 
-- Training uses remote OpenEnv `reset/step` calls instead of importing `ReasonBudgetEnvironment` in-process.
-- Hosted Spaces may have limited concurrency; for sustained RL training, use your own duplicated Space or a local Docker deployment as recommended in OpenEnv docs.
+- Training uses OpenEnv `reset/step` calls over HTTP instead of importing `ReasonBudgetEnvironment` in-process.
+- Hosted Spaces may have limited concurrency; for sustained RL training, use your own duplicated Space or a local deployment.

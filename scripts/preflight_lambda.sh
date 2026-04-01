@@ -1,0 +1,144 @@
+#!/bin/bash
+# preflight_lambda.sh -- Sanity checks before GRPO training on Lambda Cloud VMs.
+#
+# Usage:
+#   export REPT_ROOT=/home/ubuntu/ReasoningEconomicsPT
+#   export REPT_VENV=/home/ubuntu/.venvs/rept-lambda
+#   export ENV_BASE_URL=http://127.0.0.1:8000
+#   export REPT_FS_NAME=<lambda-filesystem-name>   # optional
+#   export REPT_DATA_ROOT=/lambda/nfs/<fs-name>/rept  # optional override
+#   bash scripts/preflight_lambda.sh
+
+set -euo pipefail
+
+FAIL=0
+WARN=0
+
+pass()  { echo "  [PASS] $*"; }
+fail()  { echo "  [FAIL] $*"; FAIL=$((FAIL + 1)); }
+warn()  { echo "  [WARN] $*"; WARN=$((WARN + 1)); }
+
+if [[ -n "${REPT_DATA_ROOT:-}" ]]; then
+    DATA_ROOT="$REPT_DATA_ROOT"
+elif [[ -n "${REPT_FS_NAME:-}" ]]; then
+    DATA_ROOT="/lambda/nfs/${REPT_FS_NAME}/rept"
+else
+    DATA_ROOT="/lambda/nfs/rept"
+fi
+
+REPT_OUTPUT_DIR="${REPT_OUTPUT_DIR:-${DATA_ROOT}/runs/grpo_train_lambda}"
+
+echo "=== Lambda Preflight Checks ==="
+echo ""
+
+echo "--- Required environment variables ---"
+for var in REPT_ROOT REPT_VENV ENV_BASE_URL; do
+    if [[ -z "${!var:-}" ]]; then
+        fail "$var is not set"
+    else
+        pass "$var = ${!var}"
+    fi
+done
+
+echo ""
+echo "--- Paths ---"
+if [[ -n "${REPT_ROOT:-}" && -d "$REPT_ROOT" ]]; then
+    pass "REPT_ROOT directory exists"
+elif [[ -n "${REPT_ROOT:-}" ]]; then
+    fail "REPT_ROOT directory does not exist: $REPT_ROOT"
+fi
+
+if [[ -n "${REPT_VENV:-}" && -f "$REPT_VENV/bin/activate" ]]; then
+    pass "REPT_VENV has bin/activate"
+elif [[ -n "${REPT_VENV:-}" ]]; then
+    fail "REPT_VENV missing or no bin/activate: $REPT_VENV (run bootstrap first)"
+fi
+
+if [[ -d "$DATA_ROOT" ]]; then
+    pass "Data root exists: $DATA_ROOT"
+else
+    warn "Data root does not exist yet: $DATA_ROOT"
+    warn "  Create it or set REPT_DATA_ROOT to your mounted Lambda filesystem path."
+fi
+
+echo ""
+echo "--- Output directory ---"
+if [[ "$REPT_OUTPUT_DIR" == /lambda/nfs/* ]]; then
+    pass "REPT_OUTPUT_DIR is on Lambda filesystem mount: $REPT_OUTPUT_DIR"
+else
+    warn "REPT_OUTPUT_DIR is not under /lambda/nfs: $REPT_OUTPUT_DIR"
+    warn "  Large checkpoints can exhaust root volume; consider /lambda/nfs/<fs>/rept/runs/..."
+fi
+
+echo ""
+echo "--- GPU checks ---"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    if nvidia-smi --query-gpu=name,driver_version --format=csv,noheader >/dev/null 2>&1; then
+        GPU_INFO=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | tr '\n' '; ')
+        pass "nvidia-smi OK ($GPU_INFO)"
+    else
+        fail "nvidia-smi command failed"
+    fi
+else
+    fail "nvidia-smi not found in PATH"
+fi
+
+echo ""
+echo "--- Python from venv ---"
+if [[ -n "${REPT_VENV:-}" && -f "$REPT_VENV/bin/python" ]]; then
+    VENV_PY="$REPT_VENV/bin/python"
+    PY_VER=$("$VENV_PY" --version 2>&1 || echo "unknown")
+    pass "Python: $PY_VER"
+
+    echo ""
+    echo "--- Critical imports ---"
+    for mod in torch vllm trl transformers datasets openenv; do
+        if "$VENV_PY" -c "import $mod" >/dev/null 2>&1; then
+            pass "import $mod"
+        else
+            fail "import $mod failed (run bootstrap or reinstall deps)"
+        fi
+    done
+
+    CUDA_OK=$("$VENV_PY" -c "import torch; print(int(torch.cuda.is_available()))" 2>/dev/null || echo "0")
+    if [[ "$CUDA_OK" == "1" ]]; then
+        pass "torch.cuda.is_available() is True"
+    else
+        fail "torch.cuda.is_available() is False"
+    fi
+else
+    fail "Cannot run Python checks because REPT_VENV python is unavailable"
+fi
+
+echo ""
+echo "--- Env endpoint ---"
+if [[ -n "${ENV_BASE_URL:-}" ]]; then
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$ENV_BASE_URL/health" 2>/dev/null || echo "000")
+    if [[ "$HTTP_CODE" == "200" ]]; then
+        pass "ENV_BASE_URL /health returned 200"
+    elif [[ "$HTTP_CODE" == "000" ]]; then
+        fail "ENV_BASE_URL unreachable (timeout or DNS failure): $ENV_BASE_URL"
+    else
+        fail "ENV_BASE_URL /health returned HTTP $HTTP_CODE (expected 200)"
+    fi
+fi
+
+echo ""
+echo "--- Disk usage ---"
+echo "  Home:"
+df -h "$HOME" | sed -n '1,2p' || true
+if [[ -d "$DATA_ROOT" ]]; then
+    echo "  Data root:"
+    df -h "$DATA_ROOT" | sed -n '1,2p' || true
+fi
+
+echo ""
+echo "=== Summary: $FAIL failure(s), $WARN warning(s) ==="
+if [[ $FAIL -gt 0 ]]; then
+    echo "Fix failures before launching training."
+    exit 1
+fi
+if [[ $WARN -gt 0 ]]; then
+    echo "Warnings present -- review before launching."
+fi
+echo "Preflight complete."
