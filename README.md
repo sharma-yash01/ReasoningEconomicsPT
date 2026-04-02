@@ -10,6 +10,8 @@ Install core training dependencies:
 pip install -r requirements.txt
 ```
 
+Note: GRPO `environment_factory` tool-calling requires `jmespath` (already included in requirements).
+
 ### Production (recommended on hyperscalers)
 
 Install the environment client artifact from your Hugging Face Space:

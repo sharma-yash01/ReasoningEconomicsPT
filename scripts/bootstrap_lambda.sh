@@ -101,12 +101,14 @@ import vllm
 import trl
 import transformers
 import openenv
+import jmespath
 
 print(f"  torch        {torch.__version__}  CUDA={torch.cuda.is_available()}")
 print(f"  vllm         {vllm.__version__}")
 print(f"  trl          {trl.__version__}")
 print(f"  transformers {transformers.__version__}")
 print("  openenv-core OK")
+print(f"  jmespath     {jmespath.__version__}")
 PY
 
 echo ""

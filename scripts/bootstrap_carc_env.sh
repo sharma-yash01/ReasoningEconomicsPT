@@ -71,6 +71,8 @@ import transformers
 print(f'  transformers {transformers.__version__}')
 import openenv
 print(f'  openenv-core OK')
+import jmespath
+print(f'  jmespath     {jmespath.__version__}')
 "
 
 echo ""

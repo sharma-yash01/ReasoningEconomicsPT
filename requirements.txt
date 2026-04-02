@@ -1,6 +1,7 @@
 # ---- Core training stack (pinned for reproducibility) ----
 openenv-core[core]==0.2.*
 trl==1.0.0
+jmespath>=1.0.1
 transformers>=5.2.0
 datasets>=2.21
 accelerate>=1.2

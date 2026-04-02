@@ -29,6 +29,18 @@ SYSTEM_PROMPT = (
 )
 
 
+def _ensure_environment_factory_deps():
+    """Fail fast for tool-calling deps required by TRL environment_factory."""
+    try:
+        import jmespath  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "Missing dependency 'jmespath'. TRL GRPOTrainer with "
+            "environment_factory/tools requires it. Install with "
+            "`pip install jmespath` or add it to requirements."
+        ) from exc
+
+
 def format_observation_prompt(obs: dict):
     """Format an environment observation into a natural language prompt for the LLM."""
     history = obs.get("history", [])
@@ -140,6 +152,8 @@ def main():
     parser.add_argument("--env_base_url", type=str, default=None)
     parser.add_argument("--space_url", type=str, default=None)
     args = parser.parse_args()
+
+    _ensure_environment_factory_deps()
 
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer

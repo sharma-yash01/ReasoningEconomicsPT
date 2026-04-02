@@ -74,7 +74,7 @@ if [[ -n "${REPT_VENV:-}" && -f "$REPT_VENV/bin/python" ]]; then
 
     echo ""
     echo "--- Critical imports ---"
-    for mod in torch vllm trl transformers datasets openenv; do
+    for mod in torch vllm trl transformers datasets openenv jmespath; do
         if "$VENV_PY" -c "import $mod" 2>/dev/null; then
             pass "import $mod"
         else

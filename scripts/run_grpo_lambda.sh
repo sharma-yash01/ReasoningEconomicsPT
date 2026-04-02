@@ -60,7 +60,7 @@ else
     DATA_ROOT="/lambda/nfs/rept"
 fi
 
-REPT_MODEL="${REPT_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
+REPT_MODEL="${REPT_MODEL:-Qwen/Qwen3-8B}"
 REPT_OUTPUT_DIR="${REPT_OUTPUT_DIR:-${DATA_ROOT}/runs/grpo_train_lambda}"
 REPT_NUM_EPOCHS="${REPT_NUM_EPOCHS:-1}"
 REPT_NUM_GENERATIONS="${REPT_NUM_GENERATIONS:-8}"
@@ -125,6 +125,18 @@ echo "  Output dir:  $REPT_OUTPUT_DIR"
 echo "  Env URL:     $ENV_BASE_URL"
 echo "  vLLM mode:   $REPT_VLLM_MODE"
 echo "==============================="
+
+# ------------------------------------------------------------------ dependency precheck
+echo ">>> Verifying critical Python imports..."
+for mod in torch vllm trl transformers datasets openenv jmespath; do
+    if python -c "import $mod" >/dev/null 2>&1; then
+        echo "  [PASS] import $mod"
+    else
+        echo "  [FAIL] import $mod"
+        echo "Install/update dependencies first (bootstrap_lambda.sh or REPT_INSTALL_DEPS_ON_RUN=1)."
+        exit 1
+    fi
+done
 
 TRAIN_CMD=(
     python -m training.grpo_train
