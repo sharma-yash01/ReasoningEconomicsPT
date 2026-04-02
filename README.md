@@ -73,11 +73,10 @@ bash scripts/bootstrap_lambda.sh
 
 Notes:
 
-- `bootstrap_lambda.sh` installs from `requirements.txt` by default.
-- If CUDA wheel compatibility needs an override, set:
+- `bootstrap_lambda.sh` and `run_grpo_lambda.sh` (when `REPT_INSTALL_DEPS_ON_RUN=1`) default to `requirements.lambda.txt`. Override with `REPT_REQUIREMENTS_FILE` if needed (e.g. `requirements.txt` for experiments).
+- Recommended for reliable CUDA wheels:
 
 ```bash
-export REPT_REQUIREMENTS_FILE="$REPT_ROOT/requirements.txt"
 export PYTORCH_WHEEL_INDEX="https://download.pytorch.org/whl/cu121"
 ```
 
@@ -185,10 +184,11 @@ bash scripts/submit_grpo_carc.sh
 
 ## Dependency files
 
-- `requirements.txt` -- default training dependencies, used by Lambda scripts.
+- `requirements.txt` -- default training dependencies (generic; used if `REPT_REQUIREMENTS_FILE` unset).
+- `requirements.lambda.txt` -- Lambda-recommended pins (matches v2.1 / cross-chat stack: torch 2.8.*, vLLM 0.10.2, trl 1.0.0, transformers>=5.2.0).
 - `requirements.carc-cu121.txt` -- CARC-specific lock file for Discovery CUDA stack.
 
-If Lambda wheel compatibility requires different pins, add a dedicated `requirements.lambda.txt` instead of modifying the CARC file.
+Use `requirements.lambda.txt` on Lambda instead of loosening `vllm` in `requirements.txt` (avoids pip resolver conflicts with `torch` / `pydantic`).
 
 ## Notes
 

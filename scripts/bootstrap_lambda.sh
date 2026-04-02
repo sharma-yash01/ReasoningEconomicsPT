@@ -6,6 +6,8 @@
 #   export REPT_VENV=/home/ubuntu/.venvs/rept-lambda
 #   export REPT_FS_NAME=<lambda-filesystem-name>   # optional if REPT_DATA_ROOT set
 #   export REPT_DATA_ROOT=/lambda/nfs/<fs-name>/rept  # optional override
+#   export PYTORCH_WHEEL_INDEX=https://download.pytorch.org/whl/cu121  # recommended for torch wheels
+#   export REPT_REQUIREMENTS_FILE="$REPT_ROOT/requirements.txt"  # override default pin file if needed
 #   bash scripts/bootstrap_lambda.sh
 
 set -euo pipefail
@@ -21,7 +23,7 @@ else
     DATA_ROOT="/lambda/nfs/rept"
 fi
 
-REPT_REQUIREMENTS_FILE="${REPT_REQUIREMENTS_FILE:-$REPT_ROOT/requirements.txt}"
+REPT_REQUIREMENTS_FILE="${REPT_REQUIREMENTS_FILE:-$REPT_ROOT/requirements.lambda.txt}"
 PYTORCH_WHEEL_INDEX="${PYTORCH_WHEEL_INDEX:-}"
 
 CACHE_ROOT="${DATA_ROOT}/cache"

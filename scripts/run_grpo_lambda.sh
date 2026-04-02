@@ -35,7 +35,7 @@ usage() {
     echo "  REPT_ALPHA            default: 1.0"
     echo "  REPT_LOG_EVERY        default: 1"
     echo "  REPT_INSTALL_DEPS_ON_RUN  default: 0 (set to 1 to pip install before run)"
-    echo "  REPT_REQUIREMENTS_FILE    default: <REPT_ROOT>/requirements.txt"
+    echo "  REPT_REQUIREMENTS_FILE    default: <REPT_ROOT>/requirements.lambda.txt"
     echo "  PYTORCH_WHEEL_INDEX       optional pip extra index URL"
     exit 1
 }
@@ -70,7 +70,7 @@ REPT_VLLM_MODE="${REPT_VLLM_MODE:-colocate}"
 REPT_ALPHA="${REPT_ALPHA:-1.0}"
 REPT_LOG_EVERY="${REPT_LOG_EVERY:-1}"
 REPT_INSTALL_DEPS_ON_RUN="${REPT_INSTALL_DEPS_ON_RUN:-0}"
-REPT_REQUIREMENTS_FILE="${REPT_REQUIREMENTS_FILE:-$REPT_ROOT/requirements.txt}"
+REPT_REQUIREMENTS_FILE="${REPT_REQUIREMENTS_FILE:-$REPT_ROOT/requirements.lambda.txt}"
 PYTORCH_WHEEL_INDEX="${PYTORCH_WHEEL_INDEX:-}"
 
 CACHE_ROOT="${DATA_ROOT}/cache"

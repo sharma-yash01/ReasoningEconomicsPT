@@ -48,6 +48,18 @@ elif [[ -n "${REPT_ROOT:-}" ]]; then
     fail "REPT_ROOT directory does not exist: $REPT_ROOT"
 fi
 
+REQ_FILE="${REPT_REQUIREMENTS_FILE:-${REPT_ROOT:-}/requirements.lambda.txt}"
+if [[ -n "${REPT_ROOT:-}" && -d "$REPT_ROOT" ]]; then
+    echo ""
+    echo "--- Requirements file ---"
+    if [[ -f "$REQ_FILE" ]]; then
+        pass "requirements file exists: $REQ_FILE"
+    else
+        warn "requirements file not found: $REQ_FILE"
+        warn "  bootstrap_lambda.sh defaults to requirements.lambda.txt; set REPT_REQUIREMENTS_FILE to override."
+    fi
+fi
+
 if [[ -n "${REPT_VENV:-}" && -f "$REPT_VENV/bin/activate" ]]; then
     pass "REPT_VENV has bin/activate"
 elif [[ -n "${REPT_VENV:-}" ]]; then

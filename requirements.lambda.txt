@@ -1,0 +1,31 @@
+# Lambda Cloud GPU — pinned stack for GRPO + TRL environment_factory + vLLM.
+# Aligned with impl-context/v2.1-impl.md and cross-chat-completion.md (same versions
+# as requirements.carc-cu121.txt: torch 2.8.* + vLLM 0.10.2 + trl 1.0.0 + transformers>=5.2.0).
+#
+# Install (recommended with PyTorch CUDA wheels):
+#   pip install --upgrade pip
+#   pip install -r requirements.lambda.txt \
+#       --extra-index-url https://download.pytorch.org/whl/cu121
+#
+# With bootstrap_lambda.sh:
+#   export REPT_REQUIREMENTS_FILE="$REPT_ROOT/requirements.lambda.txt"
+#   export PYTORCH_WHEEL_INDEX="https://download.pytorch.org/whl/cu121"
+#   bash scripts/bootstrap_lambda.sh
+
+# ---- Deep learning runtime ----
+torch==2.8.*
+numpy>=1.26
+
+# ---- Inference / generation ----
+vllm==0.10.2
+
+# ---- Core training stack ----
+openenv-core[core]==0.2.*
+trl==1.0.0
+jmespath>=1.0.1
+transformers>=5.2.0
+datasets>=4.7.0
+accelerate>=1.4.0
+
+# ---- Data / config ----
+pydantic>=2.11.7
