@@ -1,0 +1,4 @@
+# Optional: reward log analysis (scripts/analyze_reward_logs.py)
+pandas>=2.0
+matplotlib>=3.8
+seaborn>=0.13

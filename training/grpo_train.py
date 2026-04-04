@@ -6,6 +6,7 @@ import argparse
 import copy
 import json
 import threading
+import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,6 +87,43 @@ def _write_episode_log(entry: dict):
             f.write(json.dumps(entry, ensure_ascii=True) + "\n")
 
 
+def resolve_env_tokenizer_name(
+    tok,
+    trainer: "GRPOTrainer",
+    override: str | None,
+    *,
+    fallback_model_id: str | None = None,
+) -> str:
+    """Hugging Face tokenizer / model id to send to the remote env (``AutoTokenizer.from_pretrained``)."""
+    if override and str(override).strip():
+        return str(override).strip()
+    name = getattr(tok, "name_or_path", None)
+    if isinstance(name, str) and name.strip():
+        s = name.strip()
+        p = Path(s)
+        if p.is_absolute():
+            warnings.warn(
+                f"Tokenizer name_or_path looks like a local path ({s!r}); the remote env "
+                "cannot load it. Pass --env_tokenizer_name with a Hugging Face model id.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return s
+    model = getattr(trainer, "model", None)
+    if model is not None:
+        cfg = getattr(model, "config", None)
+        if cfg is not None:
+            mid = getattr(cfg, "_name_or_path", None) or getattr(cfg, "name_or_path", None)
+            if isinstance(mid, str) and mid.strip():
+                return mid.strip()
+    if fallback_model_id and str(fallback_model_id).strip():
+        return str(fallback_model_id).strip()
+    raise ValueError(
+        "Could not resolve a Hugging Face model id for the remote env tokenizer. "
+        "Pass --env_tokenizer_name explicitly."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Episode session (shared reset / step logic)
 # ---------------------------------------------------------------------------
@@ -94,8 +132,9 @@ def _write_episode_log(entry: dict):
 class EpisodeSession:
     """One remote episode: reset + step with response text (same contract as former ``solve``)."""
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, *, tokenizer_name: str):
         self.client = ReasonBudgetClient(base_url=base_url)
+        self.tokenizer_name = tokenizer_name
         self.reward = 0.0
         self.done = False
         self._obs: dict | None = None
@@ -108,7 +147,7 @@ class EpisodeSession:
         self.episode_id = uuid4().hex
         self.step_logs = []
         with self.client.sync() as c:
-            result = c.reset()
+            result = c.reset(tokenizer_name=self.tokenizer_name)
         self._obs = result.observation
         return self._obs
 
@@ -118,7 +157,10 @@ class EpisodeSession:
             raise ValueError("Episode is over. No more questions.")
         prev_obs = self._obs or {}
         with self.client.sync() as c:
-            result = c.step({"response": response})
+            result = c.step({
+                "response": response,
+                "metadata": {"tokenizer_name": self.tokenizer_name},
+            })
         self._obs = result.observation
         raw_step_reward = float(result.reward or 0.0)
         step_reward = raw_step_reward
@@ -226,9 +268,10 @@ def _rollout_one_episode(
     chat_template_kwargs: dict,
     tools,
     max_episode_turns: int,
+    env_tokenizer_name: str,
 ) -> tuple[list[int], list[int], list[float], list[int], float]:
     messages = copy.deepcopy(seed_messages)
-    session = EpisodeSession(ENV_BASE_URL)
+    session = EpisodeSession(ENV_BASE_URL, tokenizer_name=env_tokenizer_name)
     obs = session.reset_episode()
     if not isinstance(messages[-1].get("content"), str):
         raise TypeError("rollout_func expects last message content to be a string for observation append.")
@@ -313,7 +356,11 @@ def _rollout_one_episode(
 # ---------------------------------------------------------------------------
 
 
-def build_rollout_func(max_episode_turns: int = 256):
+def build_rollout_func(
+    max_episode_turns: int = 256,
+    env_tokenizer_name: str | None = None,
+    fallback_model_id: str | None = None,
+):
     """Build TRL ``rollout_func`` that steps OpenEnv explicitly (no tool ``solve`` parsing)."""
 
     def rollout_func(prompts: list, trainer: "GRPOTrainer") -> dict[str, Any]:
@@ -321,6 +368,12 @@ def build_rollout_func(max_episode_turns: int = 256):
         chat_template = getattr(trainer, "chat_template", None)
         chat_kwargs = getattr(trainer, "chat_template_kwargs", None) or {}
         tools = getattr(trainer, "tools", None) or None
+        env_tok = resolve_env_tokenizer_name(
+            tok,
+            trainer,
+            env_tokenizer_name,
+            fallback_model_id=fallback_model_id,
+        )
 
         all_prompt_ids: list[list[int]] = []
         all_completion_ids: list[list[int]] = []
@@ -337,6 +390,7 @@ def build_rollout_func(max_episode_turns: int = 256):
                 chat_template_kwargs=chat_kwargs,
                 tools=tools,
                 max_episode_turns=max_episode_turns,
+                env_tokenizer_name=env_tok,
             )
             all_prompt_ids.append(p)
             all_completion_ids.append(c)
@@ -401,6 +455,16 @@ def main():
     parser.add_argument("--env_base_url", type=str, default=None)
     parser.add_argument("--space_url", type=str, default=None)
     parser.add_argument("--max_episode_turns", type=int, default=256)
+    parser.add_argument(
+        "--env_tokenizer_name",
+        type=str,
+        default=None,
+        help=(
+            "Hugging Face model id for AutoTokenizer on the remote env (aligns token counts with "
+            "the policy). Required when training from a local checkpoint path; otherwise inferred "
+            "from the tokenizer's name_or_path or --model."
+        ),
+    )
     args = parser.parse_args()
 
     from datasets import Dataset
@@ -452,7 +516,11 @@ def main():
         model=args.model,
         reward_funcs=reward_from_env,
         train_dataset=dataset,
-        rollout_func=build_rollout_func(max_episode_turns=args.max_episode_turns),
+        rollout_func=build_rollout_func(
+            max_episode_turns=args.max_episode_turns,
+            env_tokenizer_name=args.env_tokenizer_name,
+            fallback_model_id=args.model,
+        ),
         args=grpo_config,
     )
     trainer.train()

@@ -81,10 +81,14 @@ def evaluate_baseline(
     n_episodes: int,
     seed: int,
     llm_max_new_tokens: int | None = None,
+    env_tokenizer_name: str | None = None,
 ):
     results = []
     for ep in range(n_episodes):
-        result = env_client.reset(seed=seed + ep)
+        reset_kw: dict = {"seed": seed + ep}
+        if env_tokenizer_name:
+            reset_kw["tokenizer_name"] = env_tokenizer_name
+        result = env_client.reset(**reset_kw)
         obs = result.observation
         total_reward = 0.0
         tokens_per_step: list[int] = []
@@ -94,7 +98,10 @@ def evaluate_baseline(
                 baseline,
                 max_new_tokens=llm_max_new_tokens,
             )
-            result = env_client.step({"response": response})
+            step_payload: dict = {"response": response}
+            if env_tokenizer_name:
+                step_payload["metadata"] = {"tokenizer_name": env_tokenizer_name}
+            result = env_client.step(step_payload)
             obs = result.observation
             total_reward += float(result.reward or 0.0)
             history = obs.get("history", [])
@@ -148,6 +155,15 @@ def main():
     parser.add_argument("--llm_timeout_s", type=float, default=30.0)
     parser.add_argument("--llm_max_retries", type=int, default=2)
     parser.add_argument("--llm_temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--env_tokenizer_name",
+        type=str,
+        default=None,
+        help=(
+            "Optional Hugging Face model id passed to the remote env on reset/step "
+            "(same as GRPO training --env_tokenizer_name)."
+        ),
+    )
     args = parser.parse_args()
 
     env_base_url = to_openenv_base_url(
@@ -157,7 +173,10 @@ def main():
 
     with ReasonBudgetClient(base_url=env_base_url).sync() as env_client:
         # Probe config from the first reset observation metadata
-        probe = env_client.reset(seed=args.seed)
+        probe_kw: dict = {"seed": args.seed}
+        if args.env_tokenizer_name:
+            probe_kw["tokenizer_name"] = args.env_tokenizer_name.strip()
+        probe = env_client.reset(**probe_kw)
         probe_meta = probe.observation.get("metadata", {})
         min_tokens = probe_meta.get("min_tokens", 10)
         max_tokens = probe_meta.get("max_tokens", 800)
@@ -176,6 +195,9 @@ def main():
                 args.n_episodes,
                 args.seed,
                 llm_max_new_tokens=args.llm_max_new_tokens,
+                env_tokenizer_name=(
+                    args.env_tokenizer_name.strip() if args.env_tokenizer_name else None
+                ),
             )
             all_results[name] = res
 
