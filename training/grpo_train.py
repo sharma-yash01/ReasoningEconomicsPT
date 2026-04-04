@@ -130,7 +130,11 @@ def resolve_env_tokenizer_name(
 
 
 class EpisodeSession:
-    """One remote episode: reset + step with response text (same contract as former ``solve``)."""
+    """One remote episode: reset + step with response text (same contract as former ``solve``).
+
+    OpenEnv binds one server env per WebSocket; ``reset`` and every ``step`` must use the same
+    connection. Use ``with EpisodeSession(...) as session:`` for the full episode.
+    """
 
     def __init__(self, base_url: str, *, tokenizer_name: str):
         self.client = ReasonBudgetClient(base_url=base_url)
@@ -140,27 +144,57 @@ class EpisodeSession:
         self._obs: dict | None = None
         self.episode_id = ""
         self.step_logs: list[dict] = []
+        self._env: Any = None
+        self._conn_cm: Any = None
+
+    def __enter__(self) -> EpisodeSession:
+        sync_maker = getattr(self.client, "sync", None)
+        if callable(sync_maker):
+            self._conn_cm = sync_maker()
+            self._env = self._conn_cm.__enter__()
+        else:
+            self._conn_cm = None
+            self.client.__enter__()
+            self._env = self.client
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool | None:
+        try:
+            if self._conn_cm is not None:
+                return self._conn_cm.__exit__(exc_type, exc_val, exc_tb)
+            return self.client.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self._env = None
+            self._conn_cm = None
 
     def reset_episode(self) -> dict:
+        if self._env is None:
+            raise RuntimeError(
+                "EpisodeSession must be used as a context manager "
+                "(with EpisodeSession(...) as session: ...)."
+            )
         self.reward = 0.0
         self.done = False
         self.episode_id = uuid4().hex
         self.step_logs = []
-        with self.client.sync() as c:
-            result = c.reset(tokenizer_name=self.tokenizer_name)
+        result = self._env.reset(tokenizer_name=self.tokenizer_name)
         self._obs = result.observation
         return self._obs
 
     def apply_response(self, response: str) -> None:
         """Step env with model text; updates ``reward``, ``done``, ``_obs``, ``step_logs``."""
+        if self._env is None:
+            raise RuntimeError(
+                "EpisodeSession must be used as a context manager "
+                "(with EpisodeSession(...) as session: ...)."
+            )
         if self.done:
             raise ValueError("Episode is over. No more questions.")
         prev_obs = self._obs or {}
-        with self.client.sync() as c:
-            result = c.step({
-                "response": response,
-                "metadata": {"tokenizer_name": self.tokenizer_name},
-            })
+        result = self._env.step({
+            "response": response,
+            "metadata": {"tokenizer_name": self.tokenizer_name},
+        })
         self._obs = result.observation
         raw_step_reward = float(result.reward or 0.0)
         step_reward = raw_step_reward
@@ -271,62 +305,15 @@ def _rollout_one_episode(
     env_tokenizer_name: str,
 ) -> tuple[list[int], list[int], list[float], list[int], float]:
     messages = copy.deepcopy(seed_messages)
-    session = EpisodeSession(ENV_BASE_URL, tokenizer_name=env_tokenizer_name)
-    obs = session.reset_episode()
-    if not isinstance(messages[-1].get("content"), str):
-        raise TypeError("rollout_func expects last message content to be a string for observation append.")
-    messages[-1]["content"] = messages[-1]["content"] + format_observation_prompt(obs)
-
-    prompt_ids_fixed = _tokenize_messages(
-        tok,
-        messages,
-        chat_template=chat_template,
-        chat_template_kwargs=chat_template_kwargs,
-        tools=tools,
-        add_generation_prompt=True,
-    )
-
-    completion_ids: list[int] = []
-    env_mask: list[int] = []
-    logprob_seq: list[float] = []
-    turns = 0
-
-    while not session.done and turns < max_episode_turns:
-        turns += 1
-        obs = session._obs or {}
-        step_cap = _step_max_new_tokens(obs, trainer)
-        before_ids = _tokenize_messages(
-            tok,
-            messages,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-            tools=tools,
-            add_generation_prompt=True,
-        )
-
-        with _temporary_vllm_max_tokens(trainer, step_cap):
-            _, gen_ids_batch, logprobs_raw, _ = trainer.vllm_generation.generate(
-                prompts=[before_ids],
-                images=None,
-                num_generations=1,
+    with EpisodeSession(ENV_BASE_URL, tokenizer_name=env_tokenizer_name) as session:
+        obs = session.reset_episode()
+        if not isinstance(messages[-1].get("content"), str):
+            raise TypeError(
+                "rollout_func expects last message content to be a string for observation append."
             )
-        gen_ids = gen_ids_batch[0]
-        gen_lp = _squeeze_vllm_logprobs(logprobs_raw)
-        if gen_lp is None or len(gen_lp) != len(gen_ids):
-            gen_lp = [0.0] * len(gen_ids)
+        messages[-1]["content"] = messages[-1]["content"] + format_observation_prompt(obs)
 
-        completion_ids.extend(gen_ids)
-        env_mask.extend([1] * len(gen_ids))
-        logprob_seq.extend(gen_lp)
-
-        text = tok.decode(gen_ids, skip_special_tokens=True)
-        messages.append({"role": "assistant", "content": text})
-        session.apply_response(text)
-
-        if session.done:
-            break
-
-        after_asst_ids = _tokenize_messages(
+        prompt_ids_fixed = _tokenize_messages(
             tok,
             messages,
             chat_template=chat_template,
@@ -334,21 +321,72 @@ def _rollout_one_episode(
             tools=tools,
             add_generation_prompt=True,
         )
-        messages.append({"role": "user", "content": format_observation_prompt(session._obs or {})})
-        after_user_ids = _tokenize_messages(
-            tok,
-            messages,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-            tools=tools,
-            add_generation_prompt=True,
-        )
-        suffix = after_user_ids[len(after_asst_ids) :]
-        completion_ids.extend(suffix)
-        env_mask.extend([0] * len(suffix))
-        logprob_seq.extend([0.0] * len(suffix))
 
-    return prompt_ids_fixed, completion_ids, logprob_seq, env_mask, float(session.reward)
+        completion_ids: list[int] = []
+        env_mask: list[int] = []
+        logprob_seq: list[float] = []
+        turns = 0
+
+        while not session.done and turns < max_episode_turns:
+            turns += 1
+            obs = session._obs or {}
+            step_cap = _step_max_new_tokens(obs, trainer)
+            before_ids = _tokenize_messages(
+                tok,
+                messages,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                tools=tools,
+                add_generation_prompt=True,
+            )
+
+            with _temporary_vllm_max_tokens(trainer, step_cap):
+                _, gen_ids_batch, logprobs_raw, _ = trainer.vllm_generation.generate(
+                    prompts=[before_ids],
+                    images=None,
+                    num_generations=1,
+                )
+            gen_ids = gen_ids_batch[0]
+            gen_lp = _squeeze_vllm_logprobs(logprobs_raw)
+            if gen_lp is None or len(gen_lp) != len(gen_ids):
+                gen_lp = [0.0] * len(gen_ids)
+
+            completion_ids.extend(gen_ids)
+            env_mask.extend([1] * len(gen_ids))
+            logprob_seq.extend(gen_lp)
+
+            text = tok.decode(gen_ids, skip_special_tokens=True)
+            messages.append({"role": "assistant", "content": text})
+            session.apply_response(text)
+
+            if session.done:
+                break
+
+            after_asst_ids = _tokenize_messages(
+                tok,
+                messages,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                tools=tools,
+                add_generation_prompt=True,
+            )
+            messages.append(
+                {"role": "user", "content": format_observation_prompt(session._obs or {})}
+            )
+            after_user_ids = _tokenize_messages(
+                tok,
+                messages,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                tools=tools,
+                add_generation_prompt=True,
+            )
+            suffix = after_user_ids[len(after_asst_ids) :]
+            completion_ids.extend(suffix)
+            env_mask.extend([0] * len(suffix))
+            logprob_seq.extend([0.0] * len(suffix))
+
+        return prompt_ids_fixed, completion_ids, logprob_seq, env_mask, float(session.reward)
 
 
 # ---------------------------------------------------------------------------
