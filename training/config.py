@@ -8,25 +8,18 @@ from pathlib import Path
 
 @dataclass
 class TrainingRuntimeConfig:
-    """Runtime controls used by training/grpo_train.py.
-
-    After migrating to environment_factory, only ``alpha`` and the reward-
-    logging fields are actively used by grpo_train.  The remaining fields
-    are kept for backward compatibility with other consumers (e.g.
-    openenv_runtime.resolve_budget_mode_from_observation).
-    """
+    """Runtime controls used by training/grpo_train.py (rollout_func path)."""
 
     # Reward weighting (total signal path for now).
     alpha: float = 1.0
-    beta: float = 0.0  # unused by environment_factory path
+    beta: float = 0.0  # reserved for future reward shaping
 
-    # Token generation controls -- unused after environment_factory migration;
-    # the trainer now controls generation length via max_completion_length.
+    # Per-turn vLLM cap in rollout_func; also clipped by ``GRPOConfig.max_completion_length``.
     max_tokens_per_step: int = 2048
+    # Reserved for env alignment (e.g. minimum spend hints); not enforced as vLLM floor when budget is tighter.
     min_tokens_per_step: int = 10
 
-    # Mode detection controls -- unused after environment_factory migration;
-    # the env server enforces hard-cap mode directly.
+    # Used with ``openenv_runtime.resolve_budget_mode_from_observation`` for hard vs soft per-step caps.
     default_budget_mode: str = "hard"
     strict_budget_mode_metadata: bool = False
 

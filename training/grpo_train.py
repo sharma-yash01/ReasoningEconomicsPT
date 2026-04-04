@@ -1,19 +1,26 @@
-"""GRPO training script using TRL environment_factory with remote OpenEnv."""
+"""GRPO training with TRL rollout_func and remote OpenEnv (explicit env stepping)."""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from training.config import TrainingRuntimeConfig
 from training.openenv_runtime import (
     ReasonBudgetClient,
+    resolve_budget_mode_from_observation,
     to_openenv_base_url,
 )
+
+if TYPE_CHECKING:
+    from trl import GRPOTrainer
 
 
 # ---------------------------------------------------------------------------
@@ -35,18 +42,6 @@ SYSTEM_PROMPT = (
     "You are solving math problems under a shared token budget. "
     "Show your reasoning, then give your final answer in \\boxed{}."
 )
-
-
-def _ensure_environment_factory_deps():
-    """Fail fast for tool-calling deps required by TRL environment_factory."""
-    try:
-        import jmespath  # noqa: F401
-    except ImportError as exc:
-        raise ImportError(
-            "Missing dependency 'jmespath'. TRL GRPOTrainer with "
-            "environment_factory/tools requires it. Install with "
-            "`pip install jmespath` or add it to requirements."
-        ) from exc
 
 
 def format_observation_prompt(obs: dict):
@@ -92,26 +87,22 @@ def _write_episode_log(entry: dict):
 
 
 # ---------------------------------------------------------------------------
-# Environment class for TRL environment_factory
+# Episode session (shared reset / step logic)
 # ---------------------------------------------------------------------------
 
 
-class ReasonBudgetToolEnv:
-    """TRL environment_factory class wrapping the remote ReasonBudget env.
+class EpisodeSession:
+    """One remote episode: reset + step with response text (same contract as former ``solve``)."""
 
-    The trainer creates one instance per generation, calls reset() at episode
-    start, then auto-discovers solve() as a tool the model can invoke.
-    """
-
-    def __init__(self):
-        self.client = ReasonBudgetClient(base_url=ENV_BASE_URL)
+    def __init__(self, base_url: str):
+        self.client = ReasonBudgetClient(base_url=base_url)
         self.reward = 0.0
         self.done = False
         self._obs: dict | None = None
         self.episode_id = ""
         self.step_logs: list[dict] = []
 
-    def reset(self, **kwargs):
+    def reset_episode(self) -> dict:
         self.reward = 0.0
         self.done = False
         self.episode_id = uuid4().hex
@@ -119,18 +110,10 @@ class ReasonBudgetToolEnv:
         with self.client.sync() as c:
             result = c.reset()
         self._obs = result.observation
-        return format_observation_prompt(self._obs)
+        return self._obs
 
-    def solve(self, response: str):
-        """
-        Submit your solution to the current math problem.
-
-        Args:
-            response: Your full reasoning and final answer in \\boxed{}.
-
-        Returns:
-            The next problem observation, or a message that the episode is over.
-        """
+    def apply_response(self, response: str) -> None:
+        """Step env with model text; updates ``reward``, ``done``, ``_obs``, ``step_logs``."""
         if self.done:
             raise ValueError("Episode is over. No more questions.")
         prev_obs = self._obs or {}
@@ -165,18 +148,224 @@ class ReasonBudgetToolEnv:
                 "steps": self.step_logs,
                 "final_observation": self._obs,
             })
-            return "Episode complete. All questions answered."
-        return format_observation_prompt(self._obs)
 
 
 # ---------------------------------------------------------------------------
-# Reward function for GRPOTrainer (environment_factory signature)
+# Tokenization helpers (chat templating inside rollout_func)
 # ---------------------------------------------------------------------------
 
 
-def reward_from_env(environments, **kwargs):
-    """Read cumulative episode reward from each environment instance."""
-    return [env.reward for env in environments]
+def _tokenize_messages(
+    tokenizer,
+    messages: list[dict[str, Any]],
+    *,
+    chat_template: str | None,
+    chat_template_kwargs: dict,
+    tools,
+    add_generation_prompt: bool,
+) -> list[int]:
+    tokenized = tokenizer.apply_chat_template(
+        conversation=[messages],
+        tools=tools,
+        chat_template=chat_template,
+        add_generation_prompt=add_generation_prompt,
+        tokenize=True,
+        return_dict=True,
+        padding=True,
+        **chat_template_kwargs,
+    )
+    row_ids = tokenized["input_ids"][0]
+    row_mask = tokenized["attention_mask"][0]
+    return [int(t) for t, m in zip(row_ids, row_mask, strict=True) if m]
+
+
+def _squeeze_vllm_logprobs(logprobs) -> list[float] | None:
+    if logprobs is None:
+        return None
+    out: list[float] = []
+    for seq in logprobs:
+        for lp in seq:
+            out.append(float(lp[0]) if lp and lp[0] is not None else 0.0)
+    return out
+
+
+def _step_max_new_tokens(obs: dict, trainer: "GRPOTrainer") -> int:
+    cfg = RUNTIME_CFG
+    global_max = int(trainer.args.max_completion_length)
+    if cfg is None:
+        return max(1, global_max)
+    mode = resolve_budget_mode_from_observation(
+        obs,
+        default_mode=cfg.normalized_default_mode(),
+        strict=cfg.strict_budget_mode_metadata,
+    )
+    m = int(cfg.max_tokens_per_step)
+    if mode == "hard":
+        rb = int(obs.get("remaining_budget", 0))
+        m = min(m, max(0, rb))
+    return max(1, min(m, global_max))
+
+
+@contextmanager
+def _temporary_vllm_max_tokens(trainer: "GRPOTrainer", max_tokens: int):
+    vg = trainer.vllm_generation
+    prev = vg.max_completion_length
+    vg.max_completion_length = max_tokens
+    try:
+        yield
+    finally:
+        vg.max_completion_length = prev
+
+
+def _rollout_one_episode(
+    seed_messages: list,
+    trainer: "GRPOTrainer",
+    *,
+    tok,
+    chat_template,
+    chat_template_kwargs: dict,
+    tools,
+    max_episode_turns: int,
+) -> tuple[list[int], list[int], list[float], list[int], float]:
+    messages = copy.deepcopy(seed_messages)
+    session = EpisodeSession(ENV_BASE_URL)
+    obs = session.reset_episode()
+    if not isinstance(messages[-1].get("content"), str):
+        raise TypeError("rollout_func expects last message content to be a string for observation append.")
+    messages[-1]["content"] = messages[-1]["content"] + format_observation_prompt(obs)
+
+    prompt_ids_fixed = _tokenize_messages(
+        tok,
+        messages,
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+        tools=tools,
+        add_generation_prompt=True,
+    )
+
+    completion_ids: list[int] = []
+    env_mask: list[int] = []
+    logprob_seq: list[float] = []
+    turns = 0
+
+    while not session.done and turns < max_episode_turns:
+        turns += 1
+        obs = session._obs or {}
+        step_cap = _step_max_new_tokens(obs, trainer)
+        before_ids = _tokenize_messages(
+            tok,
+            messages,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+            tools=tools,
+            add_generation_prompt=True,
+        )
+
+        with _temporary_vllm_max_tokens(trainer, step_cap):
+            _, gen_ids_batch, logprobs_raw, _ = trainer.vllm_generation.generate(
+                prompts=[before_ids],
+                images=None,
+                num_generations=1,
+            )
+        gen_ids = gen_ids_batch[0]
+        gen_lp = _squeeze_vllm_logprobs(logprobs_raw)
+        if gen_lp is None or len(gen_lp) != len(gen_ids):
+            gen_lp = [0.0] * len(gen_ids)
+
+        completion_ids.extend(gen_ids)
+        env_mask.extend([1] * len(gen_ids))
+        logprob_seq.extend(gen_lp)
+
+        text = tok.decode(gen_ids, skip_special_tokens=True)
+        messages.append({"role": "assistant", "content": text})
+        session.apply_response(text)
+
+        if session.done:
+            break
+
+        after_asst_ids = _tokenize_messages(
+            tok,
+            messages,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        messages.append({"role": "user", "content": format_observation_prompt(session._obs or {})})
+        after_user_ids = _tokenize_messages(
+            tok,
+            messages,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        suffix = after_user_ids[len(after_asst_ids) :]
+        completion_ids.extend(suffix)
+        env_mask.extend([0] * len(suffix))
+        logprob_seq.extend([0.0] * len(suffix))
+
+    return prompt_ids_fixed, completion_ids, logprob_seq, env_mask, float(session.reward)
+
+
+# ---------------------------------------------------------------------------
+# Rollout
+# ---------------------------------------------------------------------------
+
+
+def build_rollout_func(max_episode_turns: int = 256):
+    """Build TRL ``rollout_func`` that steps OpenEnv explicitly (no tool ``solve`` parsing)."""
+
+    def rollout_func(prompts: list, trainer: "GRPOTrainer") -> dict[str, Any]:
+        tok = trainer.processing_class
+        chat_template = getattr(trainer, "chat_template", None)
+        chat_kwargs = getattr(trainer, "chat_template_kwargs", None) or {}
+        tools = getattr(trainer, "tools", None) or None
+
+        all_prompt_ids: list[list[int]] = []
+        all_completion_ids: list[list[int]] = []
+        all_logprobs: list[list[float]] = []
+        all_env_mask: list[list[int]] = []
+        all_env_reward: list[float] = []
+
+        for seed_messages in prompts:
+            p, c, lp, m, r = _rollout_one_episode(
+                seed_messages,
+                trainer,
+                tok=tok,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_kwargs,
+                tools=tools,
+                max_episode_turns=max_episode_turns,
+            )
+            all_prompt_ids.append(p)
+            all_completion_ids.append(c)
+            all_logprobs.append(lp)
+            all_env_mask.append(m)
+            all_env_reward.append(r)
+
+        return {
+            "prompt_ids": all_prompt_ids,
+            "completion_ids": all_completion_ids,
+            "logprobs": all_logprobs,
+            "env_mask": all_env_mask,
+            "env_reward": all_env_reward,
+        }
+
+    return rollout_func
+
+
+# ---------------------------------------------------------------------------
+# Reward function for GRPOTrainer (rollout_func + extra_fields)
+# ---------------------------------------------------------------------------
+
+
+def reward_from_env(prompts, completions, completion_ids, **kwargs):
+    """Return scalar episode reward from rollout ``env_reward`` extra field."""
+    env_reward = kwargs.get("env_reward")
+    if env_reward is not None:
+        return [float(r) for r in env_reward]
+    return [0.0] * len(prompts)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +381,14 @@ def main():
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_generations", type=int, default=8)
     parser.add_argument("--max_completion_length", type=int, default=8192)
+    parser.add_argument("--max_tokens_per_step", type=int, default=2048)
+    parser.add_argument("--min_tokens_per_step", type=int, default=10)
+    parser.add_argument("--default_budget_mode", type=str, default="hard")
+    parser.add_argument(
+        "--strict_budget_mode_metadata",
+        action="store_true",
+        help="Require observation metadata budget_mode when resolving per-step caps.",
+    )
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--no_log_rewards", action="store_true")
     parser.add_argument("--log_every_n_steps", type=int, default=1)
@@ -203,9 +400,8 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=5e-7)
     parser.add_argument("--env_base_url", type=str, default=None)
     parser.add_argument("--space_url", type=str, default=None)
+    parser.add_argument("--max_episode_turns", type=int, default=256)
     args = parser.parse_args()
-
-    _ensure_environment_factory_deps()
 
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer
@@ -219,6 +415,10 @@ def main():
         log_rewards=not args.no_log_rewards,
         log_every_n_steps=args.log_every_n_steps,
         reward_log_path=args.reward_log_path,
+        max_tokens_per_step=args.max_tokens_per_step,
+        min_tokens_per_step=args.min_tokens_per_step,
+        default_budget_mode=args.default_budget_mode,
+        strict_budget_mode_metadata=args.strict_budget_mode_metadata,
     )
     REWARD_LOG_PATH = RUNTIME_CFG.resolved_reward_log_path(args.output_dir)
     if RUNTIME_CFG.log_rewards:
@@ -230,7 +430,8 @@ def main():
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": "Solve the next math problem under budget constraints."},
             ]
-        ] * 100
+        ]
+        * 100
     })
 
     grpo_config = GRPOConfig(
@@ -251,7 +452,7 @@ def main():
         model=args.model,
         reward_funcs=reward_from_env,
         train_dataset=dataset,
-        environment_factory=ReasonBudgetToolEnv,
+        rollout_func=build_rollout_func(max_episode_turns=args.max_episode_turns),
         args=grpo_config,
     )
     trainer.train()
