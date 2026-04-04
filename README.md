@@ -56,54 +56,33 @@ python -m training.grpo_train \
 
 ## Lambda Labs On-Demand -- Recommended Workflow
 
-Use this path for single-node GRPO training on a Lambda GPU VM. It replaces CARC-specific Slurm/module flow with direct shell scripts.
+Use this path for single-node GRPO training on a Lambda GPU VM. It replaces CARC-specific Slurm/module flow with direct shell scripts (`bootstrap_lambda.sh`, `preflight_lambda.sh`, `run_grpo_lambda.sh`).
 
-### 1. One-time bootstrap
+### Environment exports (set before bootstrap and every session)
+
+From the `ReasoningEconomicsPT` checkout on the Lambda instance, set paths, NFS layout, PyTorch wheel index, OpenEnv endpoint, and training knobs. Adjust `REPT_VENV` and `REPT_FS_NAME` to match your VM layout and Lambda filesystem name.
 
 ```bash
-export REPT_ROOT=/home/ubuntu/ReasoningEconomicsPT
-export REPT_VENV=/home/ubuntu/.venvs/rept-lambda
-export REPT_FS_NAME=<lambda-filesystem-name>
-export REPT_DATA_ROOT=/lambda/nfs/$REPT_FS_NAME/rept
+cd /path/to/ReasoningEconomicsPT   # e.g. ~/ReasoningEconomicsPT
+
+export REPT_ROOT="$PWD"
+export REPT_VENV="/home/ubuntu/openenv-train/rept-venv"   # or e.g. /home/ubuntu/.venvs/rept-lambda
+export REPT_REQUIREMENTS_FILE="$REPT_ROOT/requirements.lambda.txt"
+export PYTORCH_WHEEL_INDEX="https://download.pytorch.org/whl/cu121"
+
+# Lambda Cloud Filesystem: name as shown in the Lambda dashboard (spaces allowed)
+export REPT_FS_NAME="OpenEnv-Training"   # or e.g. openenv-train
+export REPT_DATA_ROOT="/lambda/nfs/$REPT_FS_NAME/rept"
+
+# Deployed OpenEnv (Hugging Face Space or your own URL)
 export ENV_BASE_URL="https://<owner>-<space_repo>.hf.space"
 
-cd "$REPT_ROOT"
-bash scripts/bootstrap_lambda.sh
-```
+# Optional: higher Hub rate limits for model/tokenizer downloads
+# export HF_TOKEN="hf_..."
 
-Notes:
-
-- `bootstrap_lambda.sh` and `run_grpo_lambda.sh` (when `REPT_INSTALL_DEPS_ON_RUN=1`) default to `requirements.lambda.txt`. Override with `REPT_REQUIREMENTS_FILE` if needed (e.g. `requirements.txt` for experiments).
-- Recommended for reliable CUDA wheels:
-
-```bash
-export PYTORCH_WHEEL_INDEX="https://download.pytorch.org/whl/cu121"
-```
-
-### 2. Preflight checks
-
-```bash
-bash scripts/preflight_lambda.sh
-```
-
-This validates env vars, venv health, imports, GPU visibility, `torch.cuda.is_available()`, endpoint reachability, and output path placement.
-
-### 3. Launch training
-
-```bash
-export REPT_OUTPUT_DIR=/lambda/nfs/$REPT_FS_NAME/rept/runs/grpo_train_lambda
-
-# Optional dry run:
-bash scripts/run_grpo_lambda.sh --dry-run
-
-# Actual run:
-bash scripts/run_grpo_lambda.sh
-```
-
-Override defaults via exports before launch:
-
-```bash
-export REPT_MODEL="Qwen/Qwen2.5-0.5B-Instruct"
+# Training hyperparameters (defaults in run_grpo_lambda.sh apply if unset)
+export REPT_MODEL="Qwen/Qwen3-4B"
+export REPT_OUTPUT_DIR="$REPT_DATA_ROOT/runs/grpo_train_lambda"
 export REPT_NUM_EPOCHS=1
 export REPT_NUM_GENERATIONS=8
 export REPT_BATCH_SIZE=2
@@ -113,13 +92,71 @@ export REPT_ALPHA=1.0
 export REPT_LOG_EVERY=1
 ```
 
+If you are memory-limited on the GPU, lower VRAM pressure before bootstrap/run by shrinking the model and rollouts (see **Out of memory** below). Example tighter settings used in practice:
+
+```bash
+export REPT_GRAD_ACCUM=4
+export REPT_MODEL="Qwen/Qwen3-1.7B"
+export REPT_NUM_GENERATIONS=4
+```
+
+### Out of memory (OOM) on Lambda
+
+GRPO with **vLLM colocated** on one GPU loads the policy model twice (trainer + inference) and scales with **parallel rollouts**. If you see CUDA OOM, **reduce memory use in this order** (largest impact first):
+
+1. **`REPT_NUM_GENERATIONS`** — Fewer completions per step cuts peak activation and rollout memory (try `4`, then `2` for smoke).
+2. **`REPT_MODEL`** — Use a smaller Hugging Face model ID (e.g. move from 4B/8B-class checkpoints down to **1.7B** or **0.5B** instruct models that match your TRL/tool-calling constraints).
+3. **`REPT_BATCH_SIZE`** — Set to `1` to shrink the trainer micro-batch; tune **`REPT_GRAD_ACCUM`** afterward if you need a larger effective batch without increasing per-step memory (exact tradeoffs depend on TRL/GRPO—watch `nvidia-smi` while stepping).
+4. **Epochs / sequence length** — Shorter training (`REPT_NUM_EPOCHS`) does not fix peak OOM but reduces total runtime; if the trainer exposes max length flags in your fork, shorten context.
+5. **Hardware** — Reserve a Lambda instance with more VRAM, or split inference (`REPT_VLLM_MODE=server` + dedicated GPU) if your setup supports it.
+
+Re-export the variables, then rerun preflight and training.
+
+### 1. One-time bootstrap
+
+```bash
+cd "$REPT_ROOT"
+bash scripts/bootstrap_lambda.sh
+```
+
+Notes:
+
+- `bootstrap_lambda.sh` installs from `REPT_REQUIREMENTS_FILE` (default `requirements.lambda.txt`).
+- `run_grpo_lambda.sh` can reinstall deps each run with `REPT_INSTALL_DEPS_ON_RUN=1` (uses the same requirements file unless overridden).
+
+### 2. Preflight checks
+
+```bash
+cd "$REPT_ROOT"
+bash scripts/preflight_lambda.sh
+```
+
+This validates env vars, venv health, imports, GPU visibility, `torch.cuda.is_available()`, endpoint reachability, and output path placement.
+
+### 3. Launch training
+
+```bash
+cd "$REPT_ROOT"
+
+bash scripts/run_grpo_lambda.sh --dry-run
+bash scripts/run_grpo_lambda.sh
+```
+
+Long-running session in the background:
+
+```bash
+nohup bash scripts/run_grpo_lambda.sh > train.log 2>&1 &
+tail -f train.log
+watch -n 1 nvidia-smi
+```
+
 ### 4. Optional local env server on the same Lambda VM
 
 If you want to avoid remote endpoint dependency, run the env server locally and point training at localhost:
 
 ```bash
-cd /home/ubuntu/ReasoningEconomicsEnv
-python -m server.app
+cd /path/to/ReasoningEconomicsEnv
+uvicorn server.app:app --host 0.0.0.0 --port 8000
 
 # In another shell:
 export ENV_BASE_URL="http://127.0.0.1:8000"
@@ -134,13 +171,14 @@ export REPT_NUM_EPOCHS=1
 export REPT_NUM_GENERATIONS=2
 export REPT_BATCH_SIZE=1
 export REPT_GRAD_ACCUM=1
+cd "$REPT_ROOT"
 bash scripts/run_grpo_lambda.sh
 ```
 
 Confirm:
 
 - Checkpoints and trainer outputs appear under `$REPT_OUTPUT_DIR`.
-- Reward logs appear in `$REPT_OUTPUT_DIR/reward_logs.jsonl`.
+- Reward logs appear in `$REPT_OUTPUT_DIR/reward_logs.jsonl` (one JSON line per completed episode with per-question step rewards and question text).
 - Caches are under `$REPT_DATA_ROOT/cache` (`HF_HOME`, `TRANSFORMERS_CACHE`, `PIP_CACHE_DIR`).
 
 ## USC CARC (Discovery) -- Existing Workflow

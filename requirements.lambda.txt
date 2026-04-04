@@ -23,7 +23,8 @@ vllm==0.10.2
 openenv-core[core]==0.2.*
 trl==1.0.0
 jmespath>=1.0.1
-transformers>=5.2.0
+# transformers>=5.2.0, <5.4
+transformers==5.3.0
 datasets>=4.7.0
 accelerate>=1.4.0
 

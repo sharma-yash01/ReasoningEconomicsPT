@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
 from training.config import TrainingRuntimeConfig
 from training.openenv_runtime import (
@@ -17,6 +22,9 @@ from training.openenv_runtime import (
 
 ENV_BASE_URL: str = ""
 RUNTIME_CFG: TrainingRuntimeConfig | None = None
+REWARD_LOG_PATH: str = ""
+EPISODE_LOG_COUNT: int = 0
+LOG_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +74,23 @@ def format_observation_prompt(obs: dict):
     )
 
 
+def _write_episode_log(entry: dict):
+    """Append one episode-level reward record to reward_logs.jsonl."""
+    global EPISODE_LOG_COUNT
+    if RUNTIME_CFG is None or not RUNTIME_CFG.log_rewards or not REWARD_LOG_PATH:
+        return
+
+    with LOG_LOCK:
+        EPISODE_LOG_COUNT += 1
+        every_n = max(1, int(RUNTIME_CFG.log_every_n_steps))
+        if EPISODE_LOG_COUNT % every_n != 0:
+            return
+        log_path = Path(REWARD_LOG_PATH)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=True) + "\n")
+
+
 # ---------------------------------------------------------------------------
 # Environment class for TRL environment_factory
 # ---------------------------------------------------------------------------
@@ -83,10 +108,14 @@ class ReasonBudgetToolEnv:
         self.reward = 0.0
         self.done = False
         self._obs: dict | None = None
+        self.episode_id = ""
+        self.step_logs: list[dict] = []
 
     def reset(self, **kwargs):
         self.reward = 0.0
         self.done = False
+        self.episode_id = uuid4().hex
+        self.step_logs = []
         with self.client.sync() as c:
             result = c.reset()
         self._obs = result.observation
@@ -104,15 +133,38 @@ class ReasonBudgetToolEnv:
         """
         if self.done:
             raise ValueError("Episode is over. No more questions.")
+        prev_obs = self._obs or {}
         with self.client.sync() as c:
             result = c.step({"response": response})
         self._obs = result.observation
-        step_reward = float(result.reward or 0.0)
+        raw_step_reward = float(result.reward or 0.0)
+        step_reward = raw_step_reward
         if RUNTIME_CFG:
             step_reward *= RUNTIME_CFG.alpha
         self.reward += step_reward
         self.done = bool(result.done)
+
+        self.step_logs.append({
+            "step_index": len(self.step_logs) + 1,
+            "question": prev_obs.get("question", ""),
+            "question_summary": prev_obs.get("question_summary", ""),
+            "questions_remaining_before": prev_obs.get("questions_remaining"),
+            "remaining_budget_before": prev_obs.get("remaining_budget"),
+            "tokens_used_before": prev_obs.get("tokens_used"),
+            "raw_step_reward": raw_step_reward,
+            "scaled_step_reward": step_reward,
+            "done_after_step": self.done,
+        })
+
         if self.done:
+            _write_episode_log({
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "episode_id": self.episode_id,
+                "episode_reward": self.reward,
+                "num_steps": len(self.step_logs),
+                "steps": self.step_logs,
+                "final_observation": self._obs,
+            })
             return "Episode complete. All questions answered."
         return format_observation_prompt(self._obs)
 
@@ -133,7 +185,7 @@ def reward_from_env(environments, **kwargs):
 
 
 def main():
-    global ENV_BASE_URL, RUNTIME_CFG
+    global ENV_BASE_URL, RUNTIME_CFG, REWARD_LOG_PATH
 
     parser = argparse.ArgumentParser(description="GRPO training against remote OpenEnv env")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
@@ -168,6 +220,9 @@ def main():
         log_every_n_steps=args.log_every_n_steps,
         reward_log_path=args.reward_log_path,
     )
+    REWARD_LOG_PATH = RUNTIME_CFG.resolved_reward_log_path(args.output_dir)
+    if RUNTIME_CFG.log_rewards:
+        print(f"Reward episode logs: {REWARD_LOG_PATH} (every {RUNTIME_CFG.log_every_n_steps} episodes)")
 
     dataset = Dataset.from_dict({
         "prompt": [

@@ -87,6 +87,9 @@ else
     pip install -r "$REPT_REQUIREMENTS_FILE"
 fi
 
+# echo ">>> TEMORARY TRANSFORMERS PIN..."
+# pip install transformers==5.3.0 --force-reinstall --no-deps
+
 echo ""
 echo ">>> GPU visibility check"
 if command -v nvidia-smi >/dev/null 2>&1; then

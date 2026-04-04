@@ -35,13 +35,13 @@ class TrainingRuntimeConfig:
     log_every_n_steps: int = 1
     reward_log_path: str = ""
 
-    def normalized_default_mode(self) -> str:
+    def normalized_default_mode(self):
         mode = str(self.default_budget_mode or "hard").strip().lower()
         if mode in {"hard", "soft"}:
             return mode
         return "hard"
 
-    def resolved_reward_log_path(self, output_dir: str) -> str:
+    def resolved_reward_log_path(self, output_dir: str):
         if self.reward_log_path:
             return self.reward_log_path
         return str(Path(output_dir) / "reward_logs.jsonl")
