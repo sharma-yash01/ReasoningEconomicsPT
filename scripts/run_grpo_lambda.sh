@@ -7,6 +7,9 @@
 #   export ENV_BASE_URL=http://127.0.0.1:8000
 #   export REPT_FS_NAME=<lambda-filesystem-name>   # optional
 #   bash scripts/run_grpo_lambda.sh [--dry-run]
+#
+# Multi-GPU: REPT_VLLM_MODE=auto picks server if >=2 visible GPUs else colocate.
+# Server mode uses accelerate launch; vLLM occupies REPT_VLLM_TP GPUs (tensor parallel).
 
 set -euo pipefail
 
@@ -29,9 +32,17 @@ usage() {
     echo "  REPT_OUTPUT_DIR       default: <DATA_ROOT>/runs/grpo_train_lambda"
     echo "  REPT_NUM_EPOCHS       default: 1"
     echo "  REPT_NUM_GENERATIONS  default: 8"
-    echo "  REPT_BATCH_SIZE       default: 2"
-    echo "  REPT_GRAD_ACCUM       default: 8"
-    echo "  REPT_VLLM_MODE        default: colocate"
+    echo "  REPT_BATCH_SIZE       default: 8 (must divide evenly by REPT_NUM_GENERATIONS)"
+    echo "  REPT_GRAD_ACCUM       default: 8 (auto-tuned unless REPT_GRAD_ACCUM_OVERRIDE set)"
+    echo "  REPT_GRAD_ACCUM_OVERRIDE  set to any value to skip grad-accum auto-tune"
+    echo "  REPT_NUM_GPUS         default: auto (nvidia-smi count)"
+    echo "  REPT_VLLM_MODE        default: auto (server if >=2 GPUs, else colocate)"
+    echo "  REPT_VLLM_TP          default: 1 (vLLM tensor parallel GPUs in server mode)"
+    echo "  REPT_VLLM_GPU_UTIL    default: 0.9"
+    echo "  REPT_GRADIENT_CHECKPOINTING  default: 1"
+    echo "  REPT_MAX_COMPLETION_LENGTH   default: 4096"
+    echo "  REPT_NO_BF16          default: 0 (set to 1 for --no_bf16)"
+    echo "  REPT_ACCELERATE_MAIN_PORT  optional (default: 29500) for accelerate launch"
     echo "  REPT_ALPHA            default: 1.0"
     echo "  REPT_LOG_EVERY        default: 1"
     echo "  REPT_INSTALL_DEPS_ON_RUN  default: 0 (set to 1 to pip install before run)"
@@ -64,14 +75,78 @@ REPT_MODEL="${REPT_MODEL:-Qwen/Qwen3-8B}"
 REPT_OUTPUT_DIR="${REPT_OUTPUT_DIR:-${DATA_ROOT}/runs/grpo_train_lambda}"
 REPT_NUM_EPOCHS="${REPT_NUM_EPOCHS:-1}"
 REPT_NUM_GENERATIONS="${REPT_NUM_GENERATIONS:-8}"
-REPT_BATCH_SIZE="${REPT_BATCH_SIZE:-2}"
+REPT_BATCH_SIZE="${REPT_BATCH_SIZE:-8}"
 REPT_GRAD_ACCUM="${REPT_GRAD_ACCUM:-8}"
-REPT_VLLM_MODE="${REPT_VLLM_MODE:-colocate}"
+REPT_NUM_GPUS="${REPT_NUM_GPUS:-auto}"
+REPT_VLLM_TP="${REPT_VLLM_TP:-1}"
+if ! [[ "$REPT_VLLM_TP" =~ ^[0-9]+$ ]] || [[ "$REPT_VLLM_TP" -lt 1 ]]; then
+    echo "[ERROR] REPT_VLLM_TP must be a positive integer (got: $REPT_VLLM_TP)"
+    exit 1
+fi
+REPT_VLLM_GPU_UTIL="${REPT_VLLM_GPU_UTIL:-0.9}"
+REPT_VLLM_MODE="${REPT_VLLM_MODE:-auto}"
+REPT_GRADIENT_CHECKPOINTING="${REPT_GRADIENT_CHECKPOINTING:-1}"
+REPT_MAX_COMPLETION_LENGTH="${REPT_MAX_COMPLETION_LENGTH:-4096}"
+REPT_NO_BF16="${REPT_NO_BF16:-0}"
 REPT_ALPHA="${REPT_ALPHA:-1.0}"
 REPT_LOG_EVERY="${REPT_LOG_EVERY:-1}"
 REPT_INSTALL_DEPS_ON_RUN="${REPT_INSTALL_DEPS_ON_RUN:-0}"
 REPT_REQUIREMENTS_FILE="${REPT_REQUIREMENTS_FILE:-$REPT_ROOT/requirements.lambda.txt}"
 PYTORCH_WHEEL_INDEX="${PYTORCH_WHEEL_INDEX:-}"
+
+# ---- GPU fleet & vLLM mode (respects CUDA_VISIBLE_DEVICES via nvidia-smi) ----
+if [[ "$REPT_VLLM_MODE" != "auto" && "$REPT_VLLM_MODE" != "server" && "$REPT_VLLM_MODE" != "colocate" ]]; then
+    echo "[ERROR] REPT_VLLM_MODE must be auto, server, or colocate (got: $REPT_VLLM_MODE)"
+    exit 1
+fi
+
+if [[ "$REPT_NUM_GPUS" == "auto" ]]; then
+    REPT_NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
+    if ! [[ "$REPT_NUM_GPUS" =~ ^[0-9]+$ ]] || [[ "$REPT_NUM_GPUS" -lt 1 ]]; then
+        REPT_NUM_GPUS=1
+    fi
+    echo "  Auto-detected GPUs: $REPT_NUM_GPUS"
+elif ! [[ "$REPT_NUM_GPUS" =~ ^[0-9]+$ ]] || [[ "$REPT_NUM_GPUS" -lt 1 ]]; then
+    echo "[ERROR] REPT_NUM_GPUS must be auto or a positive integer (got: $REPT_NUM_GPUS)"
+    exit 1
+fi
+
+if [[ "$REPT_VLLM_MODE" == "auto" ]]; then
+    if [[ "$REPT_NUM_GPUS" -ge 2 ]]; then
+        REPT_VLLM_MODE="server"
+    else
+        REPT_VLLM_MODE="colocate"
+    fi
+    echo "  Auto-selected vLLM mode: $REPT_VLLM_MODE"
+fi
+
+if [[ "$REPT_VLLM_MODE" == "server" ]]; then
+    TRAIN_PROCS=$((REPT_NUM_GPUS - REPT_VLLM_TP))
+    if [[ "$TRAIN_PROCS" -lt 1 ]]; then
+        echo "[ERROR] Not enough GPUs for server mode: $REPT_NUM_GPUS total, TP=$REPT_VLLM_TP"
+        echo "Need at least (TP + 1) GPUs. Use colocate mode or reduce REPT_VLLM_TP."
+        exit 1
+    fi
+else
+    TRAIN_PROCS=1
+fi
+
+TARGET_EFFECTIVE_PROMPTS=16
+EFFECTIVE_PER_STEP=$((REPT_BATCH_SIZE * TRAIN_PROCS))
+if [[ -z "${REPT_GRAD_ACCUM_OVERRIDE:-}" ]] && [[ "$EFFECTIVE_PER_STEP" -gt 0 ]]; then
+    AUTO_GRAD_ACCUM=$(( (TARGET_EFFECTIVE_PROMPTS + EFFECTIVE_PER_STEP - 1) / EFFECTIVE_PER_STEP ))
+    if [[ "$AUTO_GRAD_ACCUM" -lt 1 ]]; then
+        AUTO_GRAD_ACCUM=1
+    fi
+    REPT_GRAD_ACCUM="$AUTO_GRAD_ACCUM"
+    echo "  Auto-adjusted grad_accum to $REPT_GRAD_ACCUM (target $TARGET_EFFECTIVE_PROMPTS effective prompts/step)"
+fi
+
+if [[ "$TRAIN_PROCS" -gt 1 ]]; then
+    export NCCL_TIMEOUT="${NCCL_TIMEOUT:-1800}"
+    export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+    echo "  NCCL: NCCL_TIMEOUT=${NCCL_TIMEOUT} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE} (multi-process training)"
+fi
 
 CACHE_ROOT="${DATA_ROOT}/cache"
 mkdir -p "$CACHE_ROOT/pip" "$CACHE_ROOT/huggingface" "$CACHE_ROOT/tmp" "$REPT_OUTPUT_DIR"
@@ -114,16 +189,22 @@ if [[ "$REPT_INSTALL_DEPS_ON_RUN" == "1" ]]; then
     fi
 fi
 
+GPU_LINE=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "n/a")
 echo "=== REPT GRPO Training (Lambda) ==="
-echo "  Host:        $(hostname)"
-echo "  GPU:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'n/a')"
-echo "  Python:      $(python --version)"
-echo "  Torch:       $(python -c 'import torch; print(torch.__version__)')"
-echo "  CUDA avail:  $(python -c 'import torch; print(torch.cuda.is_available())')"
-echo "  Model:       $REPT_MODEL"
-echo "  Output dir:  $REPT_OUTPUT_DIR"
-echo "  Env URL:     $ENV_BASE_URL"
-echo "  vLLM mode:   $REPT_VLLM_MODE"
+echo "  Host:            $(hostname)"
+echo "  GPUs:            ${REPT_NUM_GPUS} x ${GPU_LINE}"
+echo "  vLLM mode:       $REPT_VLLM_MODE"
+echo "  vLLM TP:         ${REPT_VLLM_TP} GPU(s)"
+echo "  Training procs:  ${TRAIN_PROCS}"
+echo "  Python:          $(python --version)"
+echo "  Torch:           $(python -c 'import torch; print(torch.__version__)')"
+echo "  CUDA avail:      $(python -c 'import torch; print(torch.cuda.is_available())')"
+echo "  Model:           $REPT_MODEL"
+echo "  Batch/device:    $REPT_BATCH_SIZE"
+echo "  Num generations: $REPT_NUM_GENERATIONS"
+echo "  Grad accum:      $REPT_GRAD_ACCUM"
+echo "  Output dir:      $REPT_OUTPUT_DIR"
+echo "  Env URL:         $ENV_BASE_URL"
 echo "==============================="
 
 # ------------------------------------------------------------------ dependency precheck
@@ -138,8 +219,16 @@ for mod in torch vllm trl transformers datasets openenv jmespath; do
     fi
 done
 
-TRAIN_CMD=(
-    python -m training.grpo_train
+if [[ "$REPT_VLLM_MODE" == "server" ]]; then
+    if ! command -v accelerate >/dev/null 2>&1; then
+        echo "  [FAIL] accelerate CLI not on PATH (required for vllm_mode=server)"
+        exit 1
+    fi
+    echo "  [PASS] accelerate CLI available"
+fi
+
+COMMON_ARGS=(
+    -m training.grpo_train
     --model "$REPT_MODEL"
     --env_base_url "$ENV_BASE_URL"
     --alpha "$REPT_ALPHA"
@@ -149,8 +238,30 @@ TRAIN_CMD=(
     --per_device_train_batch_size "$REPT_BATCH_SIZE"
     --gradient_accumulation_steps "$REPT_GRAD_ACCUM"
     --vllm_mode "$REPT_VLLM_MODE"
+    --vllm_tensor_parallel_size "$REPT_VLLM_TP"
+    --vllm_gpu_memory_utilization "$REPT_VLLM_GPU_UTIL"
+    --max_completion_length "$REPT_MAX_COMPLETION_LENGTH"
     --output_dir "$REPT_OUTPUT_DIR"
 )
+
+if [[ "${REPT_GRADIENT_CHECKPOINTING:-0}" == "1" ]]; then
+    COMMON_ARGS+=(--gradient_checkpointing)
+fi
+
+if [[ "${REPT_NO_BF16:-0}" == "1" ]]; then
+    COMMON_ARGS+=(--no_bf16)
+fi
+
+if [[ "$REPT_VLLM_MODE" == "server" ]]; then
+    TRAIN_CMD=(
+        accelerate launch
+        --num_processes "$TRAIN_PROCS"
+        --main_process_port "${REPT_ACCELERATE_MAIN_PORT:-29500}"
+        "${COMMON_ARGS[@]}"
+    )
+else
+    TRAIN_CMD=(python "${COMMON_ARGS[@]}")
+fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
     echo ""

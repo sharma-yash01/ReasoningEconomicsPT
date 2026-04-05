@@ -472,7 +472,7 @@ def main():
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_generations", type=int, default=8)
-    parser.add_argument("--max_completion_length", type=int, default=8192)
+    parser.add_argument("--max_completion_length", type=int, default=4096)
     parser.add_argument("--max_tokens_per_step", type=int, default=2048)
     parser.add_argument("--min_tokens_per_step", type=int, default=10)
     parser.add_argument("--default_budget_mode", type=str, default="hard")
@@ -488,6 +488,28 @@ def main():
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--vllm_mode", type=str, default="colocate", choices=["colocate", "server"])
+    parser.add_argument(
+        "--vllm_tensor_parallel_size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for vLLM (server mode); default 1.",
+    )
+    parser.add_argument(
+        "--vllm_gpu_memory_utilization",
+        type=float,
+        default=0.9,
+        help="GPU memory fraction for vLLM (server mode).",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce training VRAM.",
+    )
+    parser.add_argument(
+        "--no_bf16",
+        action="store_true",
+        help="Disable bfloat16 training (bf16 is on by default).",
+    )
     parser.add_argument("--output_dir", type=str, default="runs/grpo_train")
     parser.add_argument("--learning_rate", type=float, default=5e-7)
     parser.add_argument("--env_base_url", type=str, default=None)
@@ -504,6 +526,12 @@ def main():
         ),
     )
     args = parser.parse_args()
+
+    if args.per_device_train_batch_size % args.num_generations != 0:
+        raise SystemExit(
+            "per_device_train_batch_size must be divisible by num_generations "
+            f"({args.per_device_train_batch_size} % {args.num_generations} != 0)."
+        )
 
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer
@@ -540,12 +568,16 @@ def main():
         output_dir=args.output_dir,
         use_vllm=True,
         vllm_mode=args.vllm_mode,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         num_train_epochs=args.num_train_epochs,
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
+        gradient_checkpointing=args.gradient_checkpointing,
+        bf16=not args.no_bf16,
         logging_steps=1,
         save_strategy="epoch",
     )
