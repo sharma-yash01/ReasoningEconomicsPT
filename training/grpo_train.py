@@ -501,6 +501,27 @@ def main():
         help="GPU memory fraction for vLLM (server mode).",
     )
     parser.add_argument(
+        "--vllm_server_host",
+        type=str,
+        default="127.0.0.1",
+        help="Host of the trl vllm-serve process (server mode only). Default: 127.0.0.1",
+    )
+    parser.add_argument(
+        "--vllm_server_port",
+        type=int,
+        default=8001,
+        help=(
+            "Port of the trl vllm-serve process (server mode only). "
+            "Avoid 8000 if OpenEnv uses that port. Default: 8001."
+        ),
+    )
+    parser.add_argument(
+        "--vllm_group_port",
+        type=int,
+        default=51216,
+        help="Port for TRL NCCL weight-sync group between training and vLLM. Default: 51216.",
+    )
+    parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
         help="Enable gradient checkpointing to reduce training VRAM.",
@@ -570,6 +591,9 @@ def main():
         vllm_mode=args.vllm_mode,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_server_host=args.vllm_server_host,
+        vllm_server_port=args.vllm_server_port,
+        vllm_group_port=args.vllm_group_port,
         num_train_epochs=args.num_train_epochs,
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,

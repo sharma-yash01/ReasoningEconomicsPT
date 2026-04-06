@@ -9,7 +9,8 @@
 #   bash scripts/run_grpo_lambda.sh [--dry-run]
 #
 # Multi-GPU: REPT_VLLM_MODE=auto picks server if >=2 visible GPUs else colocate.
-# Server mode uses accelerate launch; vLLM occupies REPT_VLLM_TP GPUs (tensor parallel).
+# Server mode: starts trl vllm-serve on REPT_VLLM_PORT (default 8001), then accelerate launch
+# on the remaining GPUs (OpenEnv typically uses 8000 — do not collide).
 
 set -euo pipefail
 
@@ -38,6 +39,10 @@ usage() {
     echo "  REPT_NUM_GPUS         default: auto (nvidia-smi count)"
     echo "  REPT_VLLM_MODE        default: auto (server if >=2 GPUs, else colocate)"
     echo "  REPT_VLLM_TP          default: 1 (vLLM tensor parallel GPUs in server mode)"
+    echo "  REPT_VLLM_PORT        default: 8001 (trl vllm-serve HTTP; must differ from OpenEnv, often 8000)"
+    echo "  REPT_VLLM_GROUP_PORT  default: 51216 (TRL weight-sync TCP; match training --vllm_group_port)"
+    echo "  REPT_VLLM_SERVER_HOST default: 127.0.0.1 (passed to grpo_train --vllm_server_host)"
+    echo "  REPT_NCCL_P2P_DISABLE optional: if set, overrides NCCL_P2P_DISABLE for multi-GPU (else 1; use 0 on NVLink A100)"
     echo "  REPT_VLLM_GPU_UTIL    default: 0.9"
     echo "  REPT_GRADIENT_CHECKPOINTING  default: 1"
     echo "  REPT_MAX_COMPLETION_LENGTH   default: 4096"
@@ -84,6 +89,9 @@ if ! [[ "$REPT_VLLM_TP" =~ ^[0-9]+$ ]] || [[ "$REPT_VLLM_TP" -lt 1 ]]; then
     exit 1
 fi
 REPT_VLLM_GPU_UTIL="${REPT_VLLM_GPU_UTIL:-0.9}"
+REPT_VLLM_PORT="${REPT_VLLM_PORT:-8001}"
+REPT_VLLM_GROUP_PORT="${REPT_VLLM_GROUP_PORT:-51216}"
+REPT_VLLM_SERVER_HOST="${REPT_VLLM_SERVER_HOST:-127.0.0.1}"
 REPT_VLLM_MODE="${REPT_VLLM_MODE:-auto}"
 REPT_GRADIENT_CHECKPOINTING="${REPT_GRADIENT_CHECKPOINTING:-1}"
 REPT_MAX_COMPLETION_LENGTH="${REPT_MAX_COMPLETION_LENGTH:-4096}"
@@ -144,7 +152,9 @@ fi
 
 if [[ "$TRAIN_PROCS" -gt 1 ]]; then
     export NCCL_TIMEOUT="${NCCL_TIMEOUT:-1800}"
-    export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+    # Prefer REPT_NCCL_P2P_DISABLE when set; else inherit NCCL_P2P_DISABLE; default 1 (PCIe/V100-safe).
+    # On NVLink A100 SXM4, set REPT_NCCL_P2P_DISABLE=0 or export NCCL_P2P_DISABLE=0 before the script.
+    export NCCL_P2P_DISABLE="${REPT_NCCL_P2P_DISABLE:-${NCCL_P2P_DISABLE:-1}}"
     echo "  NCCL: NCCL_TIMEOUT=${NCCL_TIMEOUT} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE} (multi-process training)"
 fi
 
@@ -251,6 +261,63 @@ print('Prefetch complete.')
     echo ">>> Training will load model from: $REPT_MODEL"
 fi
 
+VLLM_PID=""
+if [[ "$REPT_VLLM_MODE" == "server" ]]; then
+    VLLM_GPU_END=$((REPT_NUM_GPUS - 1))
+    VLLM_GPU_START=$((REPT_NUM_GPUS - REPT_VLLM_TP))
+    VLLM_CUDA_DEVS=$(seq -s, "$VLLM_GPU_START" "$VLLM_GPU_END")
+    TRAIN_CUDA_DEVS=$(seq -s, 0 $((VLLM_GPU_START - 1)))
+
+    VLLM_CURL_HOST="$REPT_VLLM_SERVER_HOST"
+    if [[ "$VLLM_CURL_HOST" == "0.0.0.0" ]]; then
+        VLLM_CURL_HOST="127.0.0.1"
+    fi
+    VLLM_URL="http://${VLLM_CURL_HOST}:${REPT_VLLM_PORT}"
+
+    if [[ $DRY_RUN -eq 0 ]]; then
+        if ! command -v trl >/dev/null 2>&1; then
+            echo "[ERROR] trl CLI not on PATH (required to start trl vllm-serve in server mode)"
+            exit 1
+        fi
+        echo ">>> Starting trl vllm-serve on GPU(s) [$VLLM_CUDA_DEVS] port $REPT_VLLM_PORT ..."
+        CUDA_VISIBLE_DEVICES="$VLLM_CUDA_DEVS" \
+            trl vllm-serve \
+                --model "$REPT_MODEL" \
+                --tensor-parallel-size "$REPT_VLLM_TP" \
+                --gpu-memory-utilization "$REPT_VLLM_GPU_UTIL" \
+                --port "$REPT_VLLM_PORT" \
+            >> "$REPT_OUTPUT_DIR/vllm_serve.log" 2>&1 &
+        VLLM_PID=$!
+        echo "  vllm-serve PID: $VLLM_PID  (log: $REPT_OUTPUT_DIR/vllm_serve.log)"
+
+        echo ">>> Waiting for trl vllm-serve at $VLLM_URL ..."
+        VLLM_READY=0
+        for i in $(seq 1 120); do
+            if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+                echo "[ERROR] vllm-serve process exited early (PID $VLLM_PID). Check $REPT_OUTPUT_DIR/vllm_serve.log"
+                exit 1
+            fi
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                "${VLLM_URL}/get_world_size/" 2>/dev/null || echo "000")
+            if [[ "$HTTP_CODE" == "200" ]]; then
+                VLLM_READY=1
+                echo "  [PASS] trl vllm-serve ready at ${VLLM_URL} (attempt $i)"
+                break
+            fi
+            sleep 5
+        done
+
+        if [[ "$VLLM_READY" -ne 1 ]]; then
+            echo "[ERROR] trl vllm-serve did not become ready within 600s. Check $REPT_OUTPUT_DIR/vllm_serve.log"
+            kill "$VLLM_PID" 2>/dev/null || true
+            exit 1
+        fi
+
+        # shellcheck disable=SC2064
+        trap "echo '>>> Stopping vllm-serve (PID $VLLM_PID)...'; kill '$VLLM_PID' 2>/dev/null || true" EXIT
+    fi
+fi
+
 COMMON_ARGS=(
     -m training.grpo_train
     --model "$REPT_MODEL"
@@ -264,6 +331,9 @@ COMMON_ARGS=(
     --vllm_mode "$REPT_VLLM_MODE"
     --vllm_tensor_parallel_size "$REPT_VLLM_TP"
     --vllm_gpu_memory_utilization "$REPT_VLLM_GPU_UTIL"
+    --vllm_server_host "$REPT_VLLM_SERVER_HOST"
+    --vllm_server_port "$REPT_VLLM_PORT"
+    --vllm_group_port "$REPT_VLLM_GROUP_PORT"
     --max_completion_length "$REPT_MAX_COMPLETION_LENGTH"
     --output_dir "$REPT_OUTPUT_DIR"
 )
@@ -278,6 +348,7 @@ fi
 
 if [[ "$REPT_VLLM_MODE" == "server" ]]; then
     TRAIN_CMD=(
+        env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_DEVS"
         accelerate launch
         --num_processes "$TRAIN_PROCS"
         --main_process_port "${REPT_ACCELERATE_MAIN_PORT:-29500}"
