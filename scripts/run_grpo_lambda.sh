@@ -29,7 +29,7 @@ usage() {
     echo "Optional exports:"
     echo "  REPT_FS_NAME          Lambda filesystem name (used when REPT_DATA_ROOT unset)"
     echo "  REPT_DATA_ROOT        Base data path (default: /lambda/nfs/<fs>/rept or /lambda/nfs/rept)"
-    echo "  REPT_MODEL            default: Qwen/Qwen3-8B (Hub id → prefetched to \$DATA_ROOT/models/...)"
+    echo "  REPT_MODEL            default: Qwen/Qwen3-8B (Hub id → prefetched to \$DATA_ROOT/models/...; same id → OpenEnv tokenizer)"
     echo "  REPT_OUTPUT_DIR       default: <DATA_ROOT>/runs/grpo_train_lambda"
     echo "  REPT_NUM_EPOCHS       default: 1"
     echo "  REPT_NUM_GENERATIONS  default: 8"
@@ -77,6 +77,11 @@ else
 fi
 
 REPT_MODEL="${REPT_MODEL:-Qwen/Qwen3-8B}"
+# Hub/repo id before prefetch may rewrite REPT_MODEL to a local directory (for OpenEnv --env_tokenizer_name).
+REPT_MODEL_HUB_ID=""
+if [[ "$REPT_MODEL" != /* ]] && [[ "$REPT_MODEL" != ./* ]]; then
+    REPT_MODEL_HUB_ID="$REPT_MODEL"
+fi
 REPT_OUTPUT_DIR="${REPT_OUTPUT_DIR:-${DATA_ROOT}/runs/grpo_train_lambda}"
 REPT_NUM_EPOCHS="${REPT_NUM_EPOCHS:-1}"
 REPT_NUM_GENERATIONS="${REPT_NUM_GENERATIONS:-8}"
@@ -318,6 +323,12 @@ if [[ "$REPT_VLLM_MODE" == "server" ]]; then
     fi
 fi
 
+# OpenEnv tokenizer id = REPT_MODEL when it was a Hub id; after prefetch, --model is local so pass saved id only then.
+ENV_TOKENIZER_ARG=""
+if [[ -n "$REPT_MODEL_HUB_ID" ]] && { [[ "$REPT_MODEL" == /* ]] || [[ "$REPT_MODEL" == ./* ]]; }; then
+    ENV_TOKENIZER_ARG="$REPT_MODEL_HUB_ID"
+fi
+
 COMMON_ARGS=(
     -m training.grpo_train
     --model "$REPT_MODEL"
@@ -337,6 +348,9 @@ COMMON_ARGS=(
     --max_completion_length "$REPT_MAX_COMPLETION_LENGTH"
     --output_dir "$REPT_OUTPUT_DIR"
 )
+if [[ -n "$ENV_TOKENIZER_ARG" ]]; then
+    COMMON_ARGS+=(--env_tokenizer_name "$ENV_TOKENIZER_ARG")
+fi
 
 if [[ "${REPT_GRADIENT_CHECKPOINTING:-0}" == "1" ]]; then
     COMMON_ARGS+=(--gradient_checkpointing)
