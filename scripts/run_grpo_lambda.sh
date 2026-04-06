@@ -28,7 +28,7 @@ usage() {
     echo "Optional exports:"
     echo "  REPT_FS_NAME          Lambda filesystem name (used when REPT_DATA_ROOT unset)"
     echo "  REPT_DATA_ROOT        Base data path (default: /lambda/nfs/<fs>/rept or /lambda/nfs/rept)"
-    echo "  REPT_MODEL            default: Qwen/Qwen2.5-0.5B-Instruct"
+    echo "  REPT_MODEL            default: Qwen/Qwen3-8B (Hub id → prefetched to \$DATA_ROOT/models/...)"
     echo "  REPT_OUTPUT_DIR       default: <DATA_ROOT>/runs/grpo_train_lambda"
     echo "  REPT_NUM_EPOCHS       default: 1"
     echo "  REPT_NUM_GENERATIONS  default: 8"
@@ -209,7 +209,7 @@ echo "==============================="
 
 # ------------------------------------------------------------------ dependency precheck
 echo ">>> Verifying critical Python imports..."
-for mod in torch vllm trl transformers datasets openenv jmespath; do
+for mod in torch vllm trl transformers datasets huggingface_hub openenv jmespath; do
     if python -c "import $mod" >/dev/null 2>&1; then
         echo "  [PASS] import $mod"
     else
@@ -225,6 +225,30 @@ if [[ "$REPT_VLLM_MODE" == "server" ]]; then
         exit 1
     fi
     echo "  [PASS] accelerate CLI available"
+fi
+
+# ---- Prefetch Hub models to a plain directory (avoids NFS + concurrent Hub cache races) ----
+# If REPT_MODEL is already a path (absolute or ./...), use it as-is.
+if [[ $DRY_RUN -eq 0 ]] && [[ "$REPT_MODEL" != /* ]] && [[ "$REPT_MODEL" != ./* ]]; then
+    MODEL_LOCAL_DIR="${DATA_ROOT}/models/${REPT_MODEL//\//_}"
+    mkdir -p "${DATA_ROOT}/models"
+    if [[ ! -f "$MODEL_LOCAL_DIR/model.safetensors.index.json" ]] && \
+       [[ ! -f "$MODEL_LOCAL_DIR/model.safetensors" ]]; then
+        echo ">>> Prefetching model to plain directory: $MODEL_LOCAL_DIR"
+        python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='${REPT_MODEL}',
+    local_dir='${MODEL_LOCAL_DIR}',
+    local_dir_use_symlinks=False,
+)
+print('Prefetch complete.')
+"
+    else
+        echo ">>> Model already present at: $MODEL_LOCAL_DIR"
+    fi
+    REPT_MODEL="$MODEL_LOCAL_DIR"
+    echo ">>> Training will load model from: $REPT_MODEL"
 fi
 
 COMMON_ARGS=(
