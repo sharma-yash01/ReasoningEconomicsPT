@@ -181,7 +181,7 @@ class EpisodeSession:
         self._obs = result.observation
         return self._obs
 
-    def apply_response(self, response: str) -> None:
+    def apply_response(self, response: str):
         """Step env with model text; updates ``reward``, ``done``, ``_obs``, ``step_logs``."""
         if self._env is None:
             raise RuntimeError(
@@ -210,6 +210,7 @@ class EpisodeSession:
             "questions_remaining_before": prev_obs.get("questions_remaining"),
             "remaining_budget_before": prev_obs.get("remaining_budget"),
             "tokens_used_before": prev_obs.get("tokens_used"),
+            "model_response": response,
             "raw_step_reward": raw_step_reward,
             "scaled_step_reward": step_reward,
             "done_after_step": self.done,
