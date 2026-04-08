@@ -44,6 +44,7 @@ usage() {
     echo "  REPT_VLLM_SERVER_HOST default: 127.0.0.1 (passed to grpo_train --vllm_server_host)"
     echo "  REPT_NCCL_P2P_DISABLE optional: if set, overrides NCCL_P2P_DISABLE for multi-GPU (else 1; use 0 on NVLink A100)"
     echo "  REPT_VLLM_GPU_UTIL    default: 0.9"
+    echo "  REPT_VLLM_MAX_MODEL_LEN optional: positive int → trl vllm-serve --max_model_len (server mode only; caps KV / context)"
     echo "  REPT_GRADIENT_CHECKPOINTING  default: 1"
     echo "  REPT_MAX_COMPLETION_LENGTH   default: 4096"
     echo "  REPT_NO_BF16          default: 0 (set to 1 for --no_bf16)"
@@ -106,6 +107,13 @@ REPT_LOG_EVERY="${REPT_LOG_EVERY:-1}"
 REPT_INSTALL_DEPS_ON_RUN="${REPT_INSTALL_DEPS_ON_RUN:-0}"
 REPT_REQUIREMENTS_FILE="${REPT_REQUIREMENTS_FILE:-$REPT_ROOT/requirements.lambda.txt}"
 PYTORCH_WHEEL_INDEX="${PYTORCH_WHEEL_INDEX:-}"
+
+if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
+    if ! [[ "$REPT_VLLM_MAX_MODEL_LEN" =~ ^[0-9]+$ ]] || [[ "$REPT_VLLM_MAX_MODEL_LEN" -lt 1 ]]; then
+        echo "[ERROR] REPT_VLLM_MAX_MODEL_LEN must be a positive integer (got: $REPT_VLLM_MAX_MODEL_LEN)"
+        exit 1
+    fi
+fi
 
 # ---- GPU fleet & vLLM mode (respects CUDA_VISIBLE_DEVICES via nvidia-smi) ----
 if [[ "$REPT_VLLM_MODE" != "auto" && "$REPT_VLLM_MODE" != "server" && "$REPT_VLLM_MODE" != "colocate" ]]; then
@@ -220,6 +228,9 @@ echo "  Num generations: $REPT_NUM_GENERATIONS"
 echo "  Grad accum:      $REPT_GRAD_ACCUM"
 echo "  Output dir:      $REPT_OUTPUT_DIR"
 echo "  Env URL:         $ENV_BASE_URL"
+if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
+    echo "  vLLM max_model_len: $REPT_VLLM_MAX_MODEL_LEN (trl vllm-serve)"
+fi
 echo "==============================="
 
 # ------------------------------------------------------------------ dependency precheck
@@ -279,6 +290,11 @@ if [[ "$REPT_VLLM_MODE" == "server" ]]; then
     fi
     VLLM_URL="http://${VLLM_CURL_HOST}:${REPT_VLLM_PORT}"
 
+    VLLM_SERVE_EXTRA=()
+    if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
+        VLLM_SERVE_EXTRA+=(--max_model_len "$REPT_VLLM_MAX_MODEL_LEN")
+    fi
+
     if [[ $DRY_RUN -eq 0 ]]; then
         if ! command -v trl >/dev/null 2>&1; then
             echo "[ERROR] trl CLI not on PATH (required to start trl vllm-serve in server mode)"
@@ -291,6 +307,7 @@ if [[ "$REPT_VLLM_MODE" == "server" ]]; then
                 --tensor-parallel-size "$REPT_VLLM_TP" \
                 --gpu-memory-utilization "$REPT_VLLM_GPU_UTIL" \
                 --port "$REPT_VLLM_PORT" \
+                "${VLLM_SERVE_EXTRA[@]}" \
             >> "$REPT_OUTPUT_DIR/vllm_serve.log" 2>&1 &
         VLLM_PID=$!
         echo "  vllm-serve PID: $VLLM_PID  (log: $REPT_OUTPUT_DIR/vllm_serve.log)"
@@ -320,6 +337,8 @@ if [[ "$REPT_VLLM_MODE" == "server" ]]; then
 
         # shellcheck disable=SC2064
         trap "echo '>>> Stopping vllm-serve (PID $VLLM_PID)...'; kill '$VLLM_PID' 2>/dev/null || true" EXIT
+    else
+        echo "[DRY RUN] Would start: env CUDA_VISIBLE_DEVICES=$VLLM_CUDA_DEVS trl vllm-serve --model <path after prefetch> --tensor-parallel-size $REPT_VLLM_TP --gpu-memory-utilization $REPT_VLLM_GPU_UTIL --port $REPT_VLLM_PORT ${VLLM_SERVE_EXTRA[*]}"
     fi
 fi
 

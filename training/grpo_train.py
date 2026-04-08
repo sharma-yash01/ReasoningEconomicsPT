@@ -14,6 +14,14 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from training.config import TrainingRuntimeConfig
+from training.model_profiles import (
+    ParsedCompletion,
+    ResolvedProfile,
+    load_profiles,
+    merge_chat_template_kwargs_for_reasoning_mode,
+    parse_completion,
+    profile_lookup_model_id,
+)
 from training.openenv_runtime import (
     ReasonBudgetClient,
     resolve_budget_mode_from_observation,
@@ -33,6 +41,36 @@ RUNTIME_CFG: TrainingRuntimeConfig | None = None
 REWARD_LOG_PATH: str = ""
 EPISODE_LOG_COUNT: int = 0
 LOG_LOCK = threading.Lock()
+
+LOG_PREVIEW_CHARS = 2000
+
+
+def _truncate_for_log(s: str, max_len: int = LOG_PREVIEW_CHARS) -> str:
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + "…[truncated]"
+
+
+def _parse_completion_for_profile(text: str, profile: ResolvedProfile | None) -> ParsedCompletion:
+    if profile and profile.output_parser:
+        return parse_completion(
+            text,
+            profile.output_parser,
+            think_tag_open=profile.think_tag_open,
+            think_tag_close=profile.think_tag_close,
+        )
+    return parse_completion(text, None)
+
+
+def _build_env_step_metadata(
+    tokenizer_name: str,
+    profile: ResolvedProfile | None,
+    parsed: ParsedCompletion,
+) -> dict[str, Any]:
+    md: dict[str, Any] = {"tokenizer_name": tokenizer_name}
+    if profile and profile.grading_use_visible_only and parsed.visible.strip():
+        md["grading_response"] = parsed.visible
+    return md
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +229,12 @@ class EpisodeSession:
         self._obs = result.observation
         return self._obs
 
-    def apply_response(self, response: str):
+    def apply_response(
+        self,
+        response: str,
+        step_metadata: dict[str, Any] | None = None,
+        log_extras: dict[str, Any] | None = None,
+    ):
         """Step env with model text; updates ``reward``, ``done``, ``_obs``, ``step_logs``."""
         if self._env is None:
             raise RuntimeError(
@@ -201,9 +244,14 @@ class EpisodeSession:
         if self.done:
             raise ValueError("Episode is over. No more questions.")
         prev_obs = self._obs or {}
+        md: dict[str, Any] = {"tokenizer_name": self.tokenizer_name}
+        if step_metadata:
+            for k, v in step_metadata.items():
+                if v is not None:
+                    md[k] = v
         result = self._env.step({
             "response": response,
-            "metadata": {"tokenizer_name": self.tokenizer_name},
+            "metadata": md,
         })
         self._obs = result.observation
         raw_step_reward = float(result.reward or 0.0)
@@ -213,7 +261,7 @@ class EpisodeSession:
         self.reward += step_reward
         self.done = bool(result.done)
 
-        self.step_logs.append({
+        entry: dict[str, Any] = {
             "step_index": len(self.step_logs) + 1,
             "question": prev_obs.get("question", ""),
             "question_summary": prev_obs.get("question_summary", ""),
@@ -224,7 +272,10 @@ class EpisodeSession:
             "raw_step_reward": raw_step_reward,
             "scaled_step_reward": step_reward,
             "done_after_step": self.done,
-        })
+        }
+        if log_extras:
+            entry.update(log_extras)
+        self.step_logs.append(entry)
 
         if self.done:
             _write_episode_log({
@@ -315,6 +366,7 @@ def _rollout_one_episode(
     max_episode_turns: int,
     env_tokenizer_name: str,
     env_total_budget: int | None = None,
+    model_profile: ResolvedProfile | None = None,
 ) -> tuple[list[int], list[int], list[float], list[int], float]:
     messages = copy.deepcopy(seed_messages)
     with EpisodeSession(
@@ -373,7 +425,15 @@ def _rollout_one_episode(
 
             text = tok.decode(gen_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": text})
-            session.apply_response(text)
+            parsed = _parse_completion_for_profile(text, model_profile)
+            step_md = _build_env_step_metadata(env_tokenizer_name, model_profile, parsed)
+            log_extras: dict[str, Any] | None = None
+            if model_profile and model_profile.output_parser:
+                log_extras = {
+                    "reasoning_trace": _truncate_for_log(parsed.reasoning) if parsed.reasoning else "",
+                    "visible_response": _truncate_for_log(parsed.visible),
+                }
+            session.apply_response(text, step_metadata=step_md, log_extras=log_extras)
 
             if session.done:
                 break
@@ -415,6 +475,7 @@ def build_rollout_func(
     env_tokenizer_name: str | None = None,
     env_total_budget: int | None = None,
     fallback_model_id: str | None = None,
+    model_profile: ResolvedProfile | None = None,
 ):
     """Build TRL ``rollout_func`` that steps OpenEnv explicitly (no tool ``solve`` parsing).
 
@@ -453,6 +514,7 @@ def build_rollout_func(
                 max_episode_turns=max_episode_turns,
                 env_tokenizer_name=env_tok,
                 env_total_budget=env_total_budget,
+                model_profile=model_profile,
             )
             all_prompt_ids.append(p)
             all_completion_ids.append(c)
@@ -580,6 +642,19 @@ def main():
             "the sampled questions (if tokenizer_name is provided) or falls back to config defaults."
         ),
     )
+    parser.add_argument(
+        "--model_profiles_path",
+        type=str,
+        default=None,
+        help="Path to model_profiles.json (default: training/model_profiles.json next to this package).",
+    )
+    parser.add_argument(
+        "--reasoning_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="Chat-template enable_thinking: auto uses profile JSON; on/off forces True/False.",
+    )
     args = parser.parse_args()
 
     if args.per_device_train_batch_size % args.num_generations != 0:
@@ -608,6 +683,24 @@ def main():
     REWARD_LOG_PATH = RUNTIME_CFG.resolved_reward_log_path(args.output_dir)
     if RUNTIME_CFG.log_rewards:
         print(f"Reward episode logs: {REWARD_LOG_PATH} (every {RUNTIME_CFG.log_every_n_steps} episodes)")
+
+    profiles_path = Path(args.model_profiles_path) if args.model_profiles_path else None
+    profile_registry = load_profiles(profiles_path)
+    profile_lookup_id = profile_lookup_model_id(
+        model_arg=args.model,
+        env_tokenizer_name=args.env_tokenizer_name,
+    )
+    resolved_profile = profile_registry.resolve(profile_lookup_id)
+    merged_chat_template_kwargs = merge_chat_template_kwargs_for_reasoning_mode(
+        resolved_profile.chat_template_kwargs,
+        reasoning_mode=args.reasoning_mode,
+    )
+    print(
+        f"Model profile lookup={profile_lookup_id!r} → "
+        f"parser={resolved_profile.output_parser!r}, "
+        f"grading_use_visible_only={resolved_profile.grading_use_visible_only}, "
+        f"chat_template_kwargs={merged_chat_template_kwargs!r}"
+    )
 
     dataset = Dataset.from_dict({
         "prompt": [
@@ -638,6 +731,7 @@ def main():
         bf16=not args.no_bf16,
         logging_steps=1,
         save_strategy="epoch",
+        chat_template_kwargs=merged_chat_template_kwargs,
     )
 
     trainer = GRPOTrainer(
@@ -649,6 +743,7 @@ def main():
             env_tokenizer_name=args.env_tokenizer_name,
             env_total_budget=args.env_total_budget,
             fallback_model_id=args.model,
+            model_profile=resolved_profile,
         ),
         args=grpo_config,
     )
