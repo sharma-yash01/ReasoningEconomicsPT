@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "default": {
+    "chat_template_kwargs": {},
+    "output_parser": null,
+    "think_tag_open": null,
+    "think_tag_close": null,
+    "grading_use_visible_only": false
+  },
+  "profiles": [
+    {
+      "match_prefixes": ["Qwen/Qwen3.5", "Qwen/Qwen3"],
+      "chat_template_kwargs": { "enable_thinking": true },
+      "output_parser": "qwen3_think",
+      "think_tag_open": null,
+      "think_tag_close": null,
+      "grading_use_visible_only": true
+    }
+  ]
+}
