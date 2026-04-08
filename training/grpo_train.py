@@ -136,9 +136,16 @@ class EpisodeSession:
     connection. Use ``with EpisodeSession(...) as session:`` for the full episode.
     """
 
-    def __init__(self, base_url: str, *, tokenizer_name: str):
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        tokenizer_name: str,
+        total_budget: int | None = None,
+    ):
         self.client = ReasonBudgetClient(base_url=base_url)
         self.tokenizer_name = tokenizer_name
+        self.total_budget_override = total_budget
         self.reward = 0.0
         self.done = False
         self._obs: dict | None = None
@@ -177,7 +184,10 @@ class EpisodeSession:
         self.done = False
         self.episode_id = uuid4().hex
         self.step_logs = []
-        result = self._env.reset(tokenizer_name=self.tokenizer_name)
+        reset_kwargs: dict[str, Any] = {"tokenizer_name": self.tokenizer_name}
+        if self.total_budget_override is not None:
+            reset_kwargs["total_budget"] = self.total_budget_override
+        result = self._env.reset(**reset_kwargs)
         self._obs = result.observation
         return self._obs
 
@@ -304,9 +314,14 @@ def _rollout_one_episode(
     tools,
     max_episode_turns: int,
     env_tokenizer_name: str,
+    env_total_budget: int | None = None,
 ) -> tuple[list[int], list[int], list[float], list[int], float]:
     messages = copy.deepcopy(seed_messages)
-    with EpisodeSession(ENV_BASE_URL, tokenizer_name=env_tokenizer_name) as session:
+    with EpisodeSession(
+        ENV_BASE_URL,
+        tokenizer_name=env_tokenizer_name,
+        total_budget=env_total_budget,
+    ) as session:
         obs = session.reset_episode()
         if not isinstance(messages[-1].get("content"), str):
             raise TypeError(
@@ -398,9 +413,16 @@ def _rollout_one_episode(
 def build_rollout_func(
     max_episode_turns: int = 256,
     env_tokenizer_name: str | None = None,
+    env_total_budget: int | None = None,
     fallback_model_id: str | None = None,
 ):
-    """Build TRL ``rollout_func`` that steps OpenEnv explicitly (no tool ``solve`` parsing)."""
+    """Build TRL ``rollout_func`` that steps OpenEnv explicitly (no tool ``solve`` parsing).
+
+    When ``env_total_budget`` is ``None`` (default), the remote env computes a
+    tokenizer-native budget from the sampled questions (if ``tokenizer_name`` is
+    provided on reset).  Pass an explicit integer to override the env's budget
+    computation entirely.
+    """
 
     def rollout_func(prompts: list, trainer: "GRPOTrainer") -> dict[str, Any]:
         tok = trainer.processing_class
@@ -430,6 +452,7 @@ def build_rollout_func(
                 tools=tools,
                 max_episode_turns=max_episode_turns,
                 env_tokenizer_name=env_tok,
+                env_total_budget=env_total_budget,
             )
             all_prompt_ids.append(p)
             all_completion_ids.append(c)
@@ -470,7 +493,7 @@ def main():
     global ENV_BASE_URL, RUNTIME_CFG, REWARD_LOG_PATH
 
     parser = argparse.ArgumentParser(description="GRPO training against remote OpenEnv env")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_generations", type=int, default=8)
     parser.add_argument("--max_completion_length", type=int, default=4096)
@@ -547,6 +570,16 @@ def main():
             "from the tokenizer's name_or_path or --model."
         ),
     )
+    parser.add_argument(
+        "--env_total_budget",
+        type=int,
+        default=None,
+        help=(
+            "Explicit total token budget to send to the remote env on reset, overriding the env's "
+            "own budget computation. When omitted, the env computes a tokenizer-native budget from "
+            "the sampled questions (if tokenizer_name is provided) or falls back to config defaults."
+        ),
+    )
     args = parser.parse_args()
 
     if args.per_device_train_batch_size % args.num_generations != 0:
@@ -614,6 +647,7 @@ def main():
         rollout_func=build_rollout_func(
             max_episode_turns=args.max_episode_turns,
             env_tokenizer_name=args.env_tokenizer_name,
+            env_total_budget=args.env_total_budget,
             fallback_model_id=args.model,
         ),
         args=grpo_config,
