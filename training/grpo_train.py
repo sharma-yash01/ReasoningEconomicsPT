@@ -1,19 +1,27 @@
-"""GRPO training script using TRL environment_factory with remote OpenEnv."""
+"""GRPO training with TRL rollout_func and remote OpenEnv (explicit env stepping)."""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import threading
+import warnings
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from training.config import TrainingRuntimeConfig
 from training.openenv_runtime import (
     ReasonBudgetClient,
+    resolve_budget_mode_from_observation,
     to_openenv_base_url,
 )
+
+if TYPE_CHECKING:
+    from trl import GRPOTrainer
 
 
 # ---------------------------------------------------------------------------
@@ -35,18 +43,6 @@ SYSTEM_PROMPT = (
     "You are solving math problems under a shared token budget. "
     "Show your reasoning, then give your final answer in \\boxed{}."
 )
-
-
-def _ensure_environment_factory_deps():
-    """Fail fast for tool-calling deps required by TRL environment_factory."""
-    try:
-        import jmespath  # noqa: F401
-    except ImportError as exc:
-        raise ImportError(
-            "Missing dependency 'jmespath'. TRL GRPOTrainer with "
-            "environment_factory/tools requires it. Install with "
-            "`pip install jmespath` or add it to requirements."
-        ) from exc
 
 
 def format_observation_prompt(obs: dict):
@@ -91,51 +87,124 @@ def _write_episode_log(entry: dict):
             f.write(json.dumps(entry, ensure_ascii=True) + "\n")
 
 
+def resolve_env_tokenizer_name(
+    tok,
+    trainer: "GRPOTrainer",
+    override: str | None,
+    *,
+    fallback_model_id: str | None = None,
+) -> str:
+    """Hugging Face tokenizer / model id to send to the remote env (``AutoTokenizer.from_pretrained``)."""
+    if override and str(override).strip():
+        return str(override).strip()
+    name = getattr(tok, "name_or_path", None)
+    if isinstance(name, str) and name.strip():
+        s = name.strip()
+        p = Path(s)
+        if p.is_absolute():
+            warnings.warn(
+                f"Tokenizer name_or_path looks like a local path ({s!r}); the remote env "
+                "cannot load it. Pass --env_tokenizer_name with a Hugging Face model id.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return s
+    model = getattr(trainer, "model", None)
+    if model is not None:
+        cfg = getattr(model, "config", None)
+        if cfg is not None:
+            mid = getattr(cfg, "_name_or_path", None) or getattr(cfg, "name_or_path", None)
+            if isinstance(mid, str) and mid.strip():
+                return mid.strip()
+    if fallback_model_id and str(fallback_model_id).strip():
+        return str(fallback_model_id).strip()
+    raise ValueError(
+        "Could not resolve a Hugging Face model id for the remote env tokenizer. "
+        "Pass --env_tokenizer_name explicitly."
+    )
+
+
 # ---------------------------------------------------------------------------
-# Environment class for TRL environment_factory
+# Episode session (shared reset / step logic)
 # ---------------------------------------------------------------------------
 
 
-class ReasonBudgetToolEnv:
-    """TRL environment_factory class wrapping the remote ReasonBudget env.
+class EpisodeSession:
+    """One remote episode: reset + step with response text (same contract as former ``solve``).
 
-    The trainer creates one instance per generation, calls reset() at episode
-    start, then auto-discovers solve() as a tool the model can invoke.
+    OpenEnv binds one server env per WebSocket; ``reset`` and every ``step`` must use the same
+    connection. Use ``with EpisodeSession(...) as session:`` for the full episode.
     """
 
-    def __init__(self):
-        self.client = ReasonBudgetClient(base_url=ENV_BASE_URL)
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        tokenizer_name: str,
+        total_budget: int | None = None,
+    ):
+        self.client = ReasonBudgetClient(base_url=base_url)
+        self.tokenizer_name = tokenizer_name
+        self.total_budget_override = total_budget
         self.reward = 0.0
         self.done = False
         self._obs: dict | None = None
         self.episode_id = ""
         self.step_logs: list[dict] = []
+        self._env: Any = None
+        self._conn_cm: Any = None
 
-    def reset(self, **kwargs):
+    def __enter__(self) -> EpisodeSession:
+        sync_maker = getattr(self.client, "sync", None)
+        if callable(sync_maker):
+            self._conn_cm = sync_maker()
+            self._env = self._conn_cm.__enter__()
+        else:
+            self._conn_cm = None
+            self.client.__enter__()
+            self._env = self.client
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool | None:
+        try:
+            if self._conn_cm is not None:
+                return self._conn_cm.__exit__(exc_type, exc_val, exc_tb)
+            return self.client.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self._env = None
+            self._conn_cm = None
+
+    def reset_episode(self) -> dict:
+        if self._env is None:
+            raise RuntimeError(
+                "EpisodeSession must be used as a context manager "
+                "(with EpisodeSession(...) as session: ...)."
+            )
         self.reward = 0.0
         self.done = False
         self.episode_id = uuid4().hex
         self.step_logs = []
-        with self.client.sync() as c:
-            result = c.reset()
+        reset_kwargs: dict[str, Any] = {"tokenizer_name": self.tokenizer_name}
+        if self.total_budget_override is not None:
+            reset_kwargs["total_budget"] = self.total_budget_override
+        result = self._env.reset(**reset_kwargs)
         self._obs = result.observation
-        return format_observation_prompt(self._obs)
+        return self._obs
 
-    def solve(self, response: str):
-        """
-        Submit your solution to the current math problem.
-
-        Args:
-            response: Your full reasoning and final answer in \\boxed{}.
-
-        Returns:
-            The next problem observation, or a message that the episode is over.
-        """
+    def apply_response(self, response: str):
+        """Step env with model text; updates ``reward``, ``done``, ``_obs``, ``step_logs``."""
+        if self._env is None:
+            raise RuntimeError(
+                "EpisodeSession must be used as a context manager "
+                "(with EpisodeSession(...) as session: ...)."
+            )
         if self.done:
             raise ValueError("Episode is over. No more questions.")
         prev_obs = self._obs or {}
-        with self.client.sync() as c:
-            result = c.step({"response": response})
+        result = self._env.step({
+            "response": response,
+            "metadata": {"tokenizer_name": self.tokenizer_name},
+        })
         self._obs = result.observation
         raw_step_reward = float(result.reward or 0.0)
         step_reward = raw_step_reward
@@ -151,6 +220,7 @@ class ReasonBudgetToolEnv:
             "questions_remaining_before": prev_obs.get("questions_remaining"),
             "remaining_budget_before": prev_obs.get("remaining_budget"),
             "tokens_used_before": prev_obs.get("tokens_used"),
+            "model_response": response,
             "raw_step_reward": raw_step_reward,
             "scaled_step_reward": step_reward,
             "done_after_step": self.done,
@@ -165,18 +235,253 @@ class ReasonBudgetToolEnv:
                 "steps": self.step_logs,
                 "final_observation": self._obs,
             })
-            return "Episode complete. All questions answered."
-        return format_observation_prompt(self._obs)
 
 
 # ---------------------------------------------------------------------------
-# Reward function for GRPOTrainer (environment_factory signature)
+# Tokenization helpers (chat templating inside rollout_func)
 # ---------------------------------------------------------------------------
 
 
-def reward_from_env(environments, **kwargs):
-    """Read cumulative episode reward from each environment instance."""
-    return [env.reward for env in environments]
+def _tokenize_messages(
+    tokenizer,
+    messages: list[dict[str, Any]],
+    *,
+    chat_template: str | None,
+    chat_template_kwargs: dict,
+    tools,
+    add_generation_prompt: bool,
+) -> list[int]:
+    tokenized = tokenizer.apply_chat_template(
+        conversation=[messages],
+        tools=tools,
+        chat_template=chat_template,
+        add_generation_prompt=add_generation_prompt,
+        tokenize=True,
+        return_dict=True,
+        padding=True,
+        **chat_template_kwargs,
+    )
+    row_ids = tokenized["input_ids"][0]
+    row_mask = tokenized["attention_mask"][0]
+    return [int(t) for t, m in zip(row_ids, row_mask, strict=True) if m]
+
+
+def _squeeze_vllm_logprobs(logprobs) -> list[float] | None:
+    if logprobs is None:
+        return None
+    out: list[float] = []
+    for seq in logprobs:
+        for lp in seq:
+            out.append(float(lp[0]) if lp and lp[0] is not None else 0.0)
+    return out
+
+
+def _step_max_new_tokens(obs: dict, trainer: "GRPOTrainer") -> int:
+    cfg = RUNTIME_CFG
+    global_max = int(trainer.args.max_completion_length)
+    if cfg is None:
+        return max(1, global_max)
+    mode = resolve_budget_mode_from_observation(
+        obs,
+        default_mode=cfg.normalized_default_mode(),
+        strict=cfg.strict_budget_mode_metadata,
+    )
+    m = int(cfg.max_tokens_per_step)
+    if mode == "hard":
+        rb = int(obs.get("remaining_budget", 0))
+        m = min(m, max(0, rb))
+    return max(1, min(m, global_max))
+
+
+@contextmanager
+def _temporary_vllm_max_tokens(trainer: "GRPOTrainer", max_tokens: int):
+    vg = trainer.vllm_generation
+    prev = vg.max_completion_length
+    vg.max_completion_length = max_tokens
+    try:
+        yield
+    finally:
+        vg.max_completion_length = prev
+
+
+def _rollout_one_episode(
+    seed_messages: list,
+    trainer: "GRPOTrainer",
+    *,
+    tok,
+    chat_template,
+    chat_template_kwargs: dict,
+    tools,
+    max_episode_turns: int,
+    env_tokenizer_name: str,
+    env_total_budget: int | None = None,
+) -> tuple[list[int], list[int], list[float], list[int], float]:
+    messages = copy.deepcopy(seed_messages)
+    with EpisodeSession(
+        ENV_BASE_URL,
+        tokenizer_name=env_tokenizer_name,
+        total_budget=env_total_budget,
+    ) as session:
+        obs = session.reset_episode()
+        if not isinstance(messages[-1].get("content"), str):
+            raise TypeError(
+                "rollout_func expects last message content to be a string for observation append."
+            )
+        messages[-1]["content"] = messages[-1]["content"] + format_observation_prompt(obs)
+
+        prompt_ids_fixed = _tokenize_messages(
+            tok,
+            messages,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+            tools=tools,
+            add_generation_prompt=True,
+        )
+
+        completion_ids: list[int] = []
+        env_mask: list[int] = []
+        logprob_seq: list[float] = []
+        turns = 0
+
+        while not session.done and turns < max_episode_turns:
+            turns += 1
+            obs = session._obs or {}
+            step_cap = _step_max_new_tokens(obs, trainer)
+            before_ids = _tokenize_messages(
+                tok,
+                messages,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                tools=tools,
+                add_generation_prompt=True,
+            )
+
+            with _temporary_vllm_max_tokens(trainer, step_cap):
+                _, gen_ids_batch, logprobs_raw, _ = trainer.vllm_generation.generate(
+                    prompts=[before_ids],
+                    images=None,
+                    num_generations=1,
+                )
+            gen_ids = gen_ids_batch[0]
+            gen_lp = _squeeze_vllm_logprobs(logprobs_raw)
+            if gen_lp is None or len(gen_lp) != len(gen_ids):
+                gen_lp = [0.0] * len(gen_ids)
+
+            completion_ids.extend(gen_ids)
+            env_mask.extend([1] * len(gen_ids))
+            logprob_seq.extend(gen_lp)
+
+            text = tok.decode(gen_ids, skip_special_tokens=True)
+            messages.append({"role": "assistant", "content": text})
+            session.apply_response(text)
+
+            if session.done:
+                break
+
+            after_asst_ids = _tokenize_messages(
+                tok,
+                messages,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                tools=tools,
+                add_generation_prompt=True,
+            )
+            messages.append(
+                {"role": "user", "content": format_observation_prompt(session._obs or {})}
+            )
+            after_user_ids = _tokenize_messages(
+                tok,
+                messages,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                tools=tools,
+                add_generation_prompt=True,
+            )
+            suffix = after_user_ids[len(after_asst_ids) :]
+            completion_ids.extend(suffix)
+            env_mask.extend([0] * len(suffix))
+            logprob_seq.extend([0.0] * len(suffix))
+
+        return prompt_ids_fixed, completion_ids, logprob_seq, env_mask, float(session.reward)
+
+
+# ---------------------------------------------------------------------------
+# Rollout
+# ---------------------------------------------------------------------------
+
+
+def build_rollout_func(
+    max_episode_turns: int = 256,
+    env_tokenizer_name: str | None = None,
+    env_total_budget: int | None = None,
+    fallback_model_id: str | None = None,
+):
+    """Build TRL ``rollout_func`` that steps OpenEnv explicitly (no tool ``solve`` parsing).
+
+    When ``env_total_budget`` is ``None`` (default), the remote env computes a
+    tokenizer-native budget from the sampled questions (if ``tokenizer_name`` is
+    provided on reset).  Pass an explicit integer to override the env's budget
+    computation entirely.
+    """
+
+    def rollout_func(prompts: list, trainer: "GRPOTrainer") -> dict[str, Any]:
+        tok = trainer.processing_class
+        chat_template = getattr(trainer, "chat_template", None)
+        chat_kwargs = getattr(trainer, "chat_template_kwargs", None) or {}
+        tools = getattr(trainer, "tools", None) or None
+        env_tok = resolve_env_tokenizer_name(
+            tok,
+            trainer,
+            env_tokenizer_name,
+            fallback_model_id=fallback_model_id,
+        )
+
+        all_prompt_ids: list[list[int]] = []
+        all_completion_ids: list[list[int]] = []
+        all_logprobs: list[list[float]] = []
+        all_env_mask: list[list[int]] = []
+        all_env_reward: list[float] = []
+
+        for seed_messages in prompts:
+            p, c, lp, m, r = _rollout_one_episode(
+                seed_messages,
+                trainer,
+                tok=tok,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_kwargs,
+                tools=tools,
+                max_episode_turns=max_episode_turns,
+                env_tokenizer_name=env_tok,
+                env_total_budget=env_total_budget,
+            )
+            all_prompt_ids.append(p)
+            all_completion_ids.append(c)
+            all_logprobs.append(lp)
+            all_env_mask.append(m)
+            all_env_reward.append(r)
+
+        return {
+            "prompt_ids": all_prompt_ids,
+            "completion_ids": all_completion_ids,
+            "logprobs": all_logprobs,
+            "env_mask": all_env_mask,
+            "env_reward": all_env_reward,
+        }
+
+    return rollout_func
+
+
+# ---------------------------------------------------------------------------
+# Reward function for GRPOTrainer (rollout_func + extra_fields)
+# ---------------------------------------------------------------------------
+
+
+def reward_from_env(prompts, completions, completion_ids, **kwargs):
+    """Return scalar episode reward from rollout ``env_reward`` extra field."""
+    env_reward = kwargs.get("env_reward")
+    if env_reward is not None:
+        return [float(r) for r in env_reward]
+    return [0.0] * len(prompts)
 
 
 # ---------------------------------------------------------------------------
@@ -188,10 +493,18 @@ def main():
     global ENV_BASE_URL, RUNTIME_CFG, REWARD_LOG_PATH
 
     parser = argparse.ArgumentParser(description="GRPO training against remote OpenEnv env")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_generations", type=int, default=8)
-    parser.add_argument("--max_completion_length", type=int, default=8192)
+    parser.add_argument("--max_completion_length", type=int, default=4096)
+    parser.add_argument("--max_tokens_per_step", type=int, default=2048)
+    parser.add_argument("--min_tokens_per_step", type=int, default=10)
+    parser.add_argument("--default_budget_mode", type=str, default="hard")
+    parser.add_argument(
+        "--strict_budget_mode_metadata",
+        action="store_true",
+        help="Require observation metadata budget_mode when resolving per-step caps.",
+    )
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--no_log_rewards", action="store_true")
     parser.add_argument("--log_every_n_steps", type=int, default=1)
@@ -199,13 +512,81 @@ def main():
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--vllm_mode", type=str, default="colocate", choices=["colocate", "server"])
+    parser.add_argument(
+        "--vllm_tensor_parallel_size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for vLLM (server mode); default 1.",
+    )
+    parser.add_argument(
+        "--vllm_gpu_memory_utilization",
+        type=float,
+        default=0.9,
+        help="GPU memory fraction for vLLM (server mode).",
+    )
+    parser.add_argument(
+        "--vllm_server_host",
+        type=str,
+        default="127.0.0.1",
+        help="Host of the trl vllm-serve process (server mode only). Default: 127.0.0.1",
+    )
+    parser.add_argument(
+        "--vllm_server_port",
+        type=int,
+        default=8001,
+        help=(
+            "Port of the trl vllm-serve process (server mode only). "
+            "Avoid 8000 if OpenEnv uses that port. Default: 8001."
+        ),
+    )
+    parser.add_argument(
+        "--vllm_group_port",
+        type=int,
+        default=51216,
+        help="Port for TRL NCCL weight-sync group between training and vLLM. Default: 51216.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce training VRAM.",
+    )
+    parser.add_argument(
+        "--no_bf16",
+        action="store_true",
+        help="Disable bfloat16 training (bf16 is on by default).",
+    )
     parser.add_argument("--output_dir", type=str, default="runs/grpo_train")
     parser.add_argument("--learning_rate", type=float, default=5e-7)
     parser.add_argument("--env_base_url", type=str, default=None)
     parser.add_argument("--space_url", type=str, default=None)
+    parser.add_argument("--max_episode_turns", type=int, default=256)
+    parser.add_argument(
+        "--env_tokenizer_name",
+        type=str,
+        default=None,
+        help=(
+            "Hugging Face model id for AutoTokenizer on the remote env (aligns token counts with "
+            "the policy). Required when training from a local checkpoint path; otherwise inferred "
+            "from the tokenizer's name_or_path or --model."
+        ),
+    )
+    parser.add_argument(
+        "--env_total_budget",
+        type=int,
+        default=None,
+        help=(
+            "Explicit total token budget to send to the remote env on reset, overriding the env's "
+            "own budget computation. When omitted, the env computes a tokenizer-native budget from "
+            "the sampled questions (if tokenizer_name is provided) or falls back to config defaults."
+        ),
+    )
     args = parser.parse_args()
 
-    _ensure_environment_factory_deps()
+    if args.per_device_train_batch_size % args.num_generations != 0:
+        raise SystemExit(
+            "per_device_train_batch_size must be divisible by num_generations "
+            f"({args.per_device_train_batch_size} % {args.num_generations} != 0)."
+        )
 
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer
@@ -219,6 +600,10 @@ def main():
         log_rewards=not args.no_log_rewards,
         log_every_n_steps=args.log_every_n_steps,
         reward_log_path=args.reward_log_path,
+        max_tokens_per_step=args.max_tokens_per_step,
+        min_tokens_per_step=args.min_tokens_per_step,
+        default_budget_mode=args.default_budget_mode,
+        strict_budget_mode_metadata=args.strict_budget_mode_metadata,
     )
     REWARD_LOG_PATH = RUNTIME_CFG.resolved_reward_log_path(args.output_dir)
     if RUNTIME_CFG.log_rewards:
@@ -230,19 +615,27 @@ def main():
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": "Solve the next math problem under budget constraints."},
             ]
-        ] * 100
+        ]
+        * 100
     })
 
     grpo_config = GRPOConfig(
         output_dir=args.output_dir,
         use_vllm=True,
         vllm_mode=args.vllm_mode,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_server_host=args.vllm_server_host,
+        vllm_server_port=args.vllm_server_port,
+        vllm_group_port=args.vllm_group_port,
         num_train_epochs=args.num_train_epochs,
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
+        gradient_checkpointing=args.gradient_checkpointing,
+        bf16=not args.no_bf16,
         logging_steps=1,
         save_strategy="epoch",
     )
@@ -251,7 +644,12 @@ def main():
         model=args.model,
         reward_funcs=reward_from_env,
         train_dataset=dataset,
-        environment_factory=ReasonBudgetToolEnv,
+        rollout_func=build_rollout_func(
+            max_episode_turns=args.max_episode_turns,
+            env_tokenizer_name=args.env_tokenizer_name,
+            env_total_budget=args.env_total_budget,
+            fallback_model_id=args.model,
+        ),
         args=grpo_config,
     )
     trainer.train()

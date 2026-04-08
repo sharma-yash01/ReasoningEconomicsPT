@@ -179,6 +179,7 @@ Confirm:
 
 - Checkpoints and trainer outputs appear under `$REPT_OUTPUT_DIR`.
 - Reward logs appear in `$REPT_OUTPUT_DIR/reward_logs.jsonl` (one JSON line per completed episode with per-question step rewards and question text).
+- To plot distributions and abort heuristics: `pip install -r requirements.analysis.txt` then `python scripts/analyze_reward_logs.py "$REPT_OUTPUT_DIR/reward_logs.jsonl" --out-dir ./reward_analysis`.
 - Caches are under `$REPT_DATA_ROOT/cache` (`HF_HOME`, `TRANSFORMERS_CACHE`, `PIP_CACHE_DIR`).
 
 ## USC CARC (Discovery) -- Existing Workflow
