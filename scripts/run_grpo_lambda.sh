@@ -49,6 +49,8 @@ usage() {
     echo "  REPT_MAX_COMPLETION_LENGTH   default: 4096"
     echo "  REPT_NO_BF16          default: 0 (set to 1 for --no_bf16)"
     echo "  REPT_ACCELERATE_MAIN_PORT  optional (default: 29500) for accelerate launch"
+    echo "  REPT_MODEL_SHARDING   default: 0 (set to 1 for FSDP via config/accelerate/model-sharding.yaml; requires server mode, TRAIN_PROCS>=2)"
+    echo "  REPT_ACCELERATE_CONFIG optional path to Accelerate YAML (used when REPT_MODEL_SHARDING=1; default: <REPT_ROOT>/config/accelerate/model-sharding.yaml)"
     echo "  REPT_ALPHA            default: 1.0"
     echo "  REPT_LOG_EVERY        default: 1"
     echo "  REPT_INSTALL_DEPS_ON_RUN  default: 0 (set to 1 to pip install before run)"
@@ -107,6 +109,12 @@ REPT_LOG_EVERY="${REPT_LOG_EVERY:-1}"
 REPT_INSTALL_DEPS_ON_RUN="${REPT_INSTALL_DEPS_ON_RUN:-0}"
 REPT_REQUIREMENTS_FILE="${REPT_REQUIREMENTS_FILE:-$REPT_ROOT/requirements.lambda.txt}"
 PYTORCH_WHEEL_INDEX="${PYTORCH_WHEEL_INDEX:-}"
+REPT_MODEL_SHARDING="${REPT_MODEL_SHARDING:-0}"
+REPT_DEFAULT_SHARDING_CONFIG="${REPT_ROOT}/config/accelerate/model-sharding.yaml"
+if [[ "$REPT_MODEL_SHARDING" != "0" && "$REPT_MODEL_SHARDING" != "1" ]]; then
+    echo "[ERROR] REPT_MODEL_SHARDING must be 0 or 1 (got: $REPT_MODEL_SHARDING)"
+    exit 1
+fi
 
 if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
     if ! [[ "$REPT_VLLM_MAX_MODEL_LEN" =~ ^[0-9]+$ ]] || [[ "$REPT_VLLM_MAX_MODEL_LEN" -lt 1 ]]; then
@@ -171,6 +179,17 @@ if [[ "$TRAIN_PROCS" -gt 1 ]]; then
     echo "  NCCL: NCCL_TIMEOUT=${NCCL_TIMEOUT} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE} (multi-process training)"
 fi
 
+if [[ "$REPT_MODEL_SHARDING" == "1" ]]; then
+    if [[ "$REPT_VLLM_MODE" != "server" ]]; then
+        echo "[ERROR] REPT_MODEL_SHARDING=1 requires REPT_VLLM_MODE=server (got: $REPT_VLLM_MODE)."
+        exit 1
+    fi
+    if [[ "$TRAIN_PROCS" -lt 2 ]]; then
+        echo "[ERROR] REPT_MODEL_SHARDING=1 requires at least 2 training GPUs/processes (TRAIN_PROCS=$TRAIN_PROCS)."
+        exit 1
+    fi
+fi
+
 CACHE_ROOT="${DATA_ROOT}/cache"
 mkdir -p "$CACHE_ROOT/pip" "$CACHE_ROOT/huggingface" "$CACHE_ROOT/tmp" "$REPT_OUTPUT_DIR"
 export PIP_CACHE_DIR="$CACHE_ROOT/pip"
@@ -230,6 +249,9 @@ echo "  Output dir:      $REPT_OUTPUT_DIR"
 echo "  Env URL:         $ENV_BASE_URL"
 if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
     echo "  vLLM max_model_len: $REPT_VLLM_MAX_MODEL_LEN (trl vllm-serve)"
+fi
+if [[ "$REPT_MODEL_SHARDING" == "1" ]]; then
+    echo "  Model sharding:  FSDP (Accelerate; see config/accelerate/model-sharding.yaml)"
 fi
 echo "==============================="
 
@@ -379,12 +401,34 @@ if [[ "${REPT_NO_BF16:-0}" == "1" ]]; then
     COMMON_ARGS+=(--no_bf16)
 fi
 
+# ---- FSDP / model sharding (Accelerate --config_file) ----
+REPT_ACCEL_CONFIG_FILE=""
+if [[ "$REPT_MODEL_SHARDING" == "1" ]]; then
+    SHARD_SRC="${REPT_ACCELERATE_CONFIG:-$REPT_DEFAULT_SHARDING_CONFIG}"
+    if [[ ! -f "$SHARD_SRC" ]]; then
+        echo "[ERROR] Accelerate config for model sharding not found: $SHARD_SRC"
+        exit 1
+    fi
+    REPT_ACCEL_CONFIG_FILE="${REPT_OUTPUT_DIR}/accelerate_model_sharding_runtime.yaml"
+    if [[ $DRY_RUN -eq 0 ]]; then
+        mkdir -p "$REPT_OUTPUT_DIR"
+        sed -E "s/^num_processes:[[:space:]]*[0-9]+/num_processes: ${TRAIN_PROCS}/" "$SHARD_SRC" > "$REPT_ACCEL_CONFIG_FILE"
+        echo ">>> Model sharding: patched Accelerate config → $REPT_ACCEL_CONFIG_FILE (num_processes=$TRAIN_PROCS)"
+    fi
+fi
+
 if [[ "$REPT_VLLM_MODE" == "server" ]]; then
-    TRAIN_CMD=(
-        env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_DEVS"
+    LAUNCH_ARGS=(
         accelerate launch
         --num_processes "$TRAIN_PROCS"
         --main_process_port "${REPT_ACCELERATE_MAIN_PORT:-29500}"
+    )
+    if [[ -n "$REPT_ACCEL_CONFIG_FILE" ]]; then
+        LAUNCH_ARGS+=(--config_file "$REPT_ACCEL_CONFIG_FILE")
+    fi
+    TRAIN_CMD=(
+        env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_DEVS"
+        "${LAUNCH_ARGS[@]}"
         "${COMMON_ARGS[@]}"
     )
 else
@@ -396,6 +440,9 @@ if [[ $DRY_RUN -eq 1 ]]; then
     echo "[DRY RUN] Command:"
     printf '  %q' "${TRAIN_CMD[@]}"
     echo ""
+    if [[ -n "$REPT_ACCEL_CONFIG_FILE" ]]; then
+        echo "[DRY RUN] Would write patched Accelerate config to: $REPT_ACCEL_CONFIG_FILE"
+    fi
     exit 0
 fi
 

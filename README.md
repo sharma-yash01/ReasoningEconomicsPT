@@ -112,6 +112,17 @@ Use **`scripts/bootstrap_lambda.sh`**, **`preflight_lambda.sh`**, and **`run_grp
 | **`server`** | **`run_grpo_lambda.sh`** starts **`trl vllm-serve`** on the **last** **`REPT_VLLM_TP`** GPU(s), waits for **`GET /get_world_size/`** on **`REPT_VLLM_PORT`**, then runs **`accelerate launch`** on the remaining GPUs with **`CUDA_VISIBLE_DEVICES`** set to training GPUs only. Requires **TRL-compatible** server (not plain `vllm serve` OpenAI-only HTTP). |
 | **`colocate`** | Single-process **`python -m training.grpo_train`**; vLLM colocated with training (highest VRAM pressure). |
 
+### FSDP model sharding (`REPT_MODEL_SHARDING`)
+
+To reduce **per-GPU** parameter/optimizer memory during training, enable **Accelerate FSDP** by setting **`REPT_MODEL_SHARDING=1`**. The launcher writes a patched copy of **[`config/accelerate/model-sharding.yaml`](config/accelerate/model-sharding.yaml)** to **`$REPT_OUTPUT_DIR/accelerate_model_sharding_runtime.yaml`** with **`num_processes`** set to **`TRAIN_PROCS`** (training GPUs only, excluding the vLLM slice).
+
+| Requirement | Notes |
+|-------------|--------|
+| **`REPT_VLLM_MODE=server`** | Sharding needs **multiple training processes**; **not** supported in **`colocate`** mode. |
+| **`TRAIN_PROCS ≥ 2`** | Same as multi-GPU server training (e.g. 8 GPUs, `REPT_VLLM_TP=1` → 7 training ranks). |
+| **TRL / vLLM** | FSDP + **`trl vllm-serve`** weight sync can be version-sensitive; pinned **`trl==1.0.0`** may need a patch bump if `sync_weights` fails—see [TRL PR #3582](https://github.com/huggingface/trl/pull/3582). |
+| **DeepSpeed ZeRO** | Not wired by default; you can point **`REPT_ACCELERATE_CONFIG`** at a custom Accelerate YAML (with **`deepspeed`** installed) instead of the default **`model-sharding`** file. |
+
 **Port split (do not collide OpenEnv with TRL):**
 
 | Service | Default port |
@@ -180,6 +191,8 @@ If TRL hits **404** on **`/get_world_size/`**, the client is usually pointed at 
 | `REPT_GRADIENT_CHECKPOINTING` | `1` | Set `0` to omit `--gradient_checkpointing` |
 | `REPT_NO_BF16` | `0` | Set `1` for `--no_bf16` |
 | `REPT_ACCELERATE_MAIN_PORT` | `29500` | If port busy, change or use `0` |
+| `REPT_MODEL_SHARDING` | `0` | Set **`1`** for FSDP via **`config/accelerate/model-sharding.yaml`** (**server** mode, **`TRAIN_PROCS` ≥ 2**) |
+| `REPT_ACCELERATE_CONFIG` | unset | When **`REPT_MODEL_SHARDING=1`**, source Accelerate YAML (default: **`$REPT_ROOT/config/accelerate/model-sharding.yaml`**); **`num_processes`** is overwritten at launch |
 | `REPT_NCCL_P2P_DISABLE` | inherits / `1` | Multi-GPU only; see V100 note above |
 | `NCCL_TIMEOUT` | `1800` | Set when `TRAIN_PROCS > 1` |
 
