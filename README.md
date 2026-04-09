@@ -4,10 +4,10 @@ Post-training code for LLM/LRMs against the deployed `ReasoningEconomicsEnv` Ope
 
 ## Install
 
-Install core training dependencies:
+Install core training dependencies (multiple requirements files available, lambda is most maintained)
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.lambda.txt
 ```
 
 Note: GRPO `environment_factory` tool-calling requires `jmespath` (already included in requirements).

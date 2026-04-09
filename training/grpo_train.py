@@ -7,6 +7,9 @@ import copy
 import json
 import threading
 import warnings
+
+import torch
+import torch.distributed as dist
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +46,10 @@ EPISODE_LOG_COUNT: int = 0
 LOG_LOCK = threading.Lock()
 
 LOG_PREVIEW_CHARS = 2000
+
+# TRL vLLM server mode calls NCCL collectives inside each generate(); keep call counts
+# identical across ranks (see impl-context/dist-train-issue-hung-gpu.md).
+DIST_SERVER_GENERATES_PER_EPISODE = 8
 
 
 def _truncate_for_log(s: str, max_len: int = LOG_PREVIEW_CHARS) -> str:
@@ -355,6 +362,25 @@ def _temporary_vllm_max_tokens(trainer: "GRPOTrainer", max_tokens: int):
         vg.max_completion_length = prev
 
 
+def _pad_vllm_server_generates_to_target(
+    trainer: "GRPOTrainer",
+    local_generates: int,
+    target: int,
+    dummy_prompt_ids: list[int],
+) -> None:
+    """Pad with cheap dummy generates so every rank hits the same vLLM server collective count."""
+    vg = trainer.vllm_generation
+    if vg.mode != "server" or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return
+    for _ in range(max(0, target - local_generates)):
+        with _temporary_vllm_max_tokens(trainer, 1):
+            trainer.vllm_generation.generate(
+                prompts=[dummy_prompt_ids],
+                images=None,
+                num_generations=1,
+            )
+
+
 def _rollout_one_episode(
     seed_messages: list,
     trainer: "GRPOTrainer",
@@ -367,7 +393,8 @@ def _rollout_one_episode(
     env_tokenizer_name: str,
     env_total_budget: int | None = None,
     model_profile: ResolvedProfile | None = None,
-) -> tuple[list[int], list[int], list[float], list[int], float]:
+    per_episode_generate_cap: int | None = None,
+) -> tuple[list[int], list[int], list[float], list[int], float, int]:
     messages = copy.deepcopy(seed_messages)
     with EpisodeSession(
         ENV_BASE_URL,
@@ -394,8 +421,13 @@ def _rollout_one_episode(
         env_mask: list[int] = []
         logprob_seq: list[float] = []
         turns = 0
+        effective_turn_limit = (
+            min(max_episode_turns, per_episode_generate_cap)
+            if per_episode_generate_cap is not None
+            else max_episode_turns
+        )
 
-        while not session.done and turns < max_episode_turns:
+        while not session.done and turns < effective_turn_limit:
             turns += 1
             obs = session._obs or {}
             step_cap = _step_max_new_tokens(obs, trainer)
@@ -462,7 +494,7 @@ def _rollout_one_episode(
             env_mask.extend([0] * len(suffix))
             logprob_seq.extend([0.0] * len(suffix))
 
-        return prompt_ids_fixed, completion_ids, logprob_seq, env_mask, float(session.reward)
+        return prompt_ids_fixed, completion_ids, logprob_seq, env_mask, float(session.reward), turns
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +529,27 @@ def build_rollout_func(
             fallback_model_id=fallback_model_id,
         )
 
+        vg = trainer.vllm_generation
+        dist_server_pad = (
+            vg.mode == "server"
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+        )
+        gen_cap = DIST_SERVER_GENERATES_PER_EPISODE if dist_server_pad else None
+        dummy_prompt_ids: list[int] | None = None
+        if dist_server_pad:
+            dummy_prompt_ids = _tokenize_messages(
+                tok,
+                [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": "."},
+                ],
+                chat_template=chat_template,
+                chat_template_kwargs=chat_kwargs,
+                tools=tools,
+                add_generation_prompt=True,
+            )
+
         all_prompt_ids: list[list[int]] = []
         all_completion_ids: list[list[int]] = []
         all_logprobs: list[list[float]] = []
@@ -504,7 +557,7 @@ def build_rollout_func(
         all_env_reward: list[float] = []
 
         for seed_messages in prompts:
-            p, c, lp, m, r = _rollout_one_episode(
+            p, c, lp, m, r, n_gen = _rollout_one_episode(
                 seed_messages,
                 trainer,
                 tok=tok,
@@ -515,7 +568,15 @@ def build_rollout_func(
                 env_tokenizer_name=env_tok,
                 env_total_budget=env_total_budget,
                 model_profile=model_profile,
+                per_episode_generate_cap=gen_cap,
             )
+            if dist_server_pad and dummy_prompt_ids is not None:
+                _pad_vllm_server_generates_to_target(
+                    trainer,
+                    n_gen,
+                    DIST_SERVER_GENERATES_PER_EPISODE,
+                    dummy_prompt_ids,
+                )
             all_prompt_ids.append(p)
             all_completion_ids.append(c)
             all_logprobs.append(lp)
