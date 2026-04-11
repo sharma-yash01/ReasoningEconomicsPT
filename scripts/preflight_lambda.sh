@@ -7,6 +7,7 @@
 #   export ENV_BASE_URL=http://127.0.0.1:8000
 #   export REPT_FS_NAME=<lambda-filesystem-name>   # optional
 #   export REPT_DATA_ROOT=/lambda/nfs/<fs-name>/rept  # optional override
+#   export CUDA_VISIBLE_DEVICES=0,1,2,3  # optional; GPU layout count uses torch unless REPT_NUM_GPUS is set
 #   bash scripts/preflight_lambda.sh
 
 set -euo pipefail
@@ -84,10 +85,15 @@ fi
 
 echo ""
 echo "--- GPU checks ---"
+SMI_COUNT=0
 if command -v nvidia-smi >/dev/null 2>&1; then
     if nvidia-smi --query-gpu=name,driver_version --format=csv,noheader >/dev/null 2>&1; then
         GPU_INFO=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | tr '\n' '; ')
         pass "nvidia-smi OK ($GPU_INFO)"
+        SMI_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
+        if ! [[ "$SMI_COUNT" =~ ^[0-9]+$ ]]; then
+            SMI_COUNT=0
+        fi
     else
         fail "nvidia-smi command failed"
     fi
@@ -121,11 +127,34 @@ if [[ -n "${REPT_VENV:-}" && -f "$REPT_VENV/bin/python" ]]; then
 
     echo ""
     echo "--- Multi-GPU / training layout ---"
-    GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
-    if ! [[ "$GPU_COUNT" =~ ^[0-9]+$ ]]; then
-        GPU_COUNT=0
+    # Match run_grpo_lambda.sh: explicit REPT_NUM_GPUS=N uses N; else auto → prefer torch.cuda.device_count()
+    # (respects CUDA_VISIBLE_DEVICES). nvidia-smi always lists all driver GPUs — not a substitute.
+    CUDA_DEVICE_COUNT=$("$VENV_PY" -c "import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)" 2>/dev/null || echo "0")
+    if ! [[ "$CUDA_DEVICE_COUNT" =~ ^[0-9]+$ ]]; then
+        CUDA_DEVICE_COUNT=0
     fi
-    echo "  Visible GPUs: $GPU_COUNT"
+    REPT_NUM_GPUS="${REPT_NUM_GPUS:-auto}"
+    if [[ "$REPT_NUM_GPUS" != "auto" ]] && [[ "$REPT_NUM_GPUS" =~ ^[0-9]+$ ]] && [[ "$REPT_NUM_GPUS" -ge 1 ]]; then
+        GPU_COUNT=$REPT_NUM_GPUS
+        echo "  GPUs for layout: $GPU_COUNT (REPT_NUM_GPUS; matches run_grpo_lambda.sh when set)"
+        if [[ "$CUDA_OK" == "1" && "$CUDA_DEVICE_COUNT" -ge 1 && "$GPU_COUNT" -ne "$CUDA_DEVICE_COUNT" ]]; then
+            warn "torch.cuda.device_count()=$CUDA_DEVICE_COUNT (CUDA_VISIBLE_DEVICES) != REPT_NUM_GPUS=$GPU_COUNT — ensure training sees the GPU set you intend"
+        fi
+    else
+        GPU_COUNT=$CUDA_DEVICE_COUNT
+        if [[ "$GPU_COUNT" -lt 1 ]]; then
+            GPU_COUNT=$SMI_COUNT
+            echo "  GPUs for layout: $GPU_COUNT (fallback: nvidia-smi; CUDA device count was 0)"
+        else
+            echo "  GPUs for layout: $GPU_COUNT (torch.cuda.device_count(); respects CUDA_VISIBLE_DEVICES)"
+            if [[ "$SMI_COUNT" -gt 0 && "$GPU_COUNT" -ne "$SMI_COUNT" ]]; then
+                warn "run_grpo_lambda.sh uses nvidia-smi when REPT_NUM_GPUS=auto (would see $SMI_COUNT GPUs). Export REPT_NUM_GPUS=$GPU_COUNT to match this CUDA-visible set."
+            fi
+        fi
+    fi
+    if [[ "$SMI_COUNT" -gt 0 && "$GPU_COUNT" -ne "$SMI_COUNT" ]]; then
+        echo "  Driver GPUs (nvidia-smi, ignores CUDA_VISIBLE_DEVICES): $SMI_COUNT"
+    fi
 
     REPT_VLLM_MODE="${REPT_VLLM_MODE:-auto}"
     if [[ "$REPT_VLLM_MODE" != "auto" && "$REPT_VLLM_MODE" != "server" && "$REPT_VLLM_MODE" != "colocate" ]]; then
