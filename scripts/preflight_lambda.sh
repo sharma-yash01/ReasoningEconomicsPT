@@ -127,14 +127,22 @@ if [[ -n "${REPT_VENV:-}" && -f "$REPT_VENV/bin/python" ]]; then
 
     echo ""
     echo "--- Multi-GPU / training layout ---"
-    # Match run_grpo_lambda.sh: explicit REPT_NUM_GPUS=N uses N; else auto → prefer torch.cuda.device_count()
+    # Match run_grpo_lambda.sh: REPT_GPU_LIST wins; else explicit REPT_NUM_GPUS=N; else auto → prefer torch.cuda.device_count()
     # (respects CUDA_VISIBLE_DEVICES). nvidia-smi always lists all driver GPUs — not a substitute.
     CUDA_DEVICE_COUNT=$("$VENV_PY" -c "import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)" 2>/dev/null || echo "0")
     if ! [[ "$CUDA_DEVICE_COUNT" =~ ^[0-9]+$ ]]; then
         CUDA_DEVICE_COUNT=0
     fi
+    REPT_GPU_LIST="${REPT_GPU_LIST:-}"
     REPT_NUM_GPUS="${REPT_NUM_GPUS:-auto}"
-    if [[ "$REPT_NUM_GPUS" != "auto" ]] && [[ "$REPT_NUM_GPUS" =~ ^[0-9]+$ ]] && [[ "$REPT_NUM_GPUS" -ge 1 ]]; then
+    if [[ -n "$REPT_GPU_LIST" ]]; then
+        if ! [[ "$REPT_GPU_LIST" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            fail "REPT_GPU_LIST must be comma-separated GPU indices (got: $REPT_GPU_LIST)"
+        fi
+        IFS=',' read -ra _PF_GPU_ARRAY <<< "$REPT_GPU_LIST"
+        GPU_COUNT="${#_PF_GPU_ARRAY[@]}"
+        echo "  GPUs for layout: $GPU_COUNT (REPT_GPU_LIST=$REPT_GPU_LIST; matches run_grpo_lambda.sh)"
+    elif [[ "$REPT_NUM_GPUS" != "auto" ]] && [[ "$REPT_NUM_GPUS" =~ ^[0-9]+$ ]] && [[ "$REPT_NUM_GPUS" -ge 1 ]]; then
         GPU_COUNT=$REPT_NUM_GPUS
         echo "  GPUs for layout: $GPU_COUNT (REPT_NUM_GPUS; matches run_grpo_lambda.sh when set)"
         if [[ "$CUDA_OK" == "1" && "$CUDA_DEVICE_COUNT" -ge 1 && "$GPU_COUNT" -ne "$CUDA_DEVICE_COUNT" ]]; then

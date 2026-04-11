@@ -36,7 +36,9 @@ usage() {
     echo "  REPT_BATCH_SIZE       default: 8 (must divide evenly by REPT_NUM_GENERATIONS)"
     echo "  REPT_GRAD_ACCUM       default: 8 (auto-tuned unless REPT_GRAD_ACCUM_OVERRIDE set)"
     echo "  REPT_GRAD_ACCUM_OVERRIDE  set to any value to skip grad-accum auto-tune"
-    echo "  REPT_NUM_GPUS         default: auto (nvidia-smi count)"
+    echo "  REPT_NUM_GPUS         default: auto (nvidia-smi count); ignored when REPT_GPU_LIST is set
+  REPT_GPU_LIST         optional: explicit comma-separated physical GPU indices to use, e.g. "4,5,6,7"
+                        Last REPT_VLLM_TP entries go to vLLM; the rest to training. Overrides REPT_NUM_GPUS auto-detection."
     echo "  REPT_VLLM_MODE        default: auto (server if >=2 GPUs, else colocate)"
     echo "  REPT_VLLM_TP          default: 1 (vLLM tensor parallel GPUs in server mode)"
     echo "  REPT_VLLM_PORT        default: 8001 (trl vllm-serve HTTP; must differ from OpenEnv, often 8000)"
@@ -52,7 +54,7 @@ usage() {
     echo "  REPT_MODEL_SHARDING   default: 0 (set to 1 for FSDP via config/accelerate/model-sharding.yaml; requires server mode, TRAIN_PROCS>=2)"
     echo "  REPT_ACCELERATE_CONFIG optional path to Accelerate YAML (used when REPT_MODEL_SHARDING=1; default: <REPT_ROOT>/config/accelerate/model-sharding.yaml)"
     echo "  REPT_ALPHA            default: 1.0"
-    echo "  REPT_LOG_EVERY        default: 1"
+    echo "  REPT_LOG_EVERY        default: 1   (log every N weight updates)"
     echo "  REPT_INSTALL_DEPS_ON_RUN  default: 0 (set to 1 to pip install before run)"
     echo "  REPT_REQUIREMENTS_FILE    default: <REPT_ROOT>/requirements.lambda.txt"
     echo "  PYTORCH_WHEEL_INDEX       optional pip extra index URL"
@@ -109,8 +111,18 @@ REPT_LOG_EVERY="${REPT_LOG_EVERY:-1}"
 REPT_INSTALL_DEPS_ON_RUN="${REPT_INSTALL_DEPS_ON_RUN:-0}"
 REPT_REQUIREMENTS_FILE="${REPT_REQUIREMENTS_FILE:-$REPT_ROOT/requirements.lambda.txt}"
 PYTORCH_WHEEL_INDEX="${PYTORCH_WHEEL_INDEX:-}"
+
+# ---- Model Sharding Options ----
+# REPT_MODEL_SHARDING:
+#   0 = No sharding (default; single-process or DDP as per Accelerate/torch)
+#   1 = Enable FSDP model sharding (leverages Accelerate config for model sharding; reduces memory per GPU, enables training larger models)
+#      Set REPT_MODEL_SHARDING=1 and optionally pass your Accelerate config via REPT_ACCELERATE_CONFIG.
+#      When enabled, uses $REPT_DEFAULT_SHARDING_CONFIG unless overridden.
 REPT_MODEL_SHARDING="${REPT_MODEL_SHARDING:-0}"
 REPT_DEFAULT_SHARDING_CONFIG="${REPT_ROOT}/config/accelerate/model-sharding.yaml"
+# Explicit GPU list (e.g. "4,5,6,7"). When set, overrides REPT_NUM_GPUS auto-detection
+# and uses exactly these physical device IDs for training + vLLM assignment.
+REPT_GPU_LIST="${REPT_GPU_LIST:-}"
 
 # torch configs
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-7200}"   
@@ -128,13 +140,24 @@ if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
     fi
 fi
 
-# ---- GPU fleet & vLLM mode (respects CUDA_VISIBLE_DEVICES via nvidia-smi) ----
+# ---- GPU fleet & vLLM mode ----
 if [[ "$REPT_VLLM_MODE" != "auto" && "$REPT_VLLM_MODE" != "server" && "$REPT_VLLM_MODE" != "colocate" ]]; then
     echo "[ERROR] REPT_VLLM_MODE must be auto, server, or colocate (got: $REPT_VLLM_MODE)"
     exit 1
 fi
 
-if [[ "$REPT_NUM_GPUS" == "auto" ]]; then
+# If REPT_GPU_LIST is set (e.g. "4,5,6,7"), derive REPT_NUM_GPUS from it and use
+# the explicit list for device assignment. Otherwise fall back to nvidia-smi count.
+if [[ -n "$REPT_GPU_LIST" ]]; then
+    if ! [[ "$REPT_GPU_LIST" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        echo "[ERROR] REPT_GPU_LIST must be a comma-separated list of GPU indices (got: $REPT_GPU_LIST)"
+        exit 1
+    fi
+    # Count entries
+    IFS=',' read -ra _GPU_ARRAY <<< "$REPT_GPU_LIST"
+    REPT_NUM_GPUS="${#_GPU_ARRAY[@]}"
+    echo "  Using explicit GPU list: $REPT_GPU_LIST ($REPT_NUM_GPUS GPUs)"
+elif [[ "$REPT_NUM_GPUS" == "auto" ]]; then
     REPT_NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
     if ! [[ "$REPT_NUM_GPUS" =~ ^[0-9]+$ ]] || [[ "$REPT_NUM_GPUS" -lt 1 ]]; then
         REPT_NUM_GPUS=1
@@ -306,10 +329,18 @@ fi
 
 VLLM_PID=""
 if [[ "$REPT_VLLM_MODE" == "server" ]]; then
-    VLLM_GPU_END=$((REPT_NUM_GPUS - 1))
-    VLLM_GPU_START=$((REPT_NUM_GPUS - REPT_VLLM_TP))
-    VLLM_CUDA_DEVS=$(seq -s, "$VLLM_GPU_START" "$VLLM_GPU_END")
-    TRAIN_CUDA_DEVS=$(seq -s, 0 $((VLLM_GPU_START - 1)))
+    # Build ordered GPU list: either from REPT_GPU_LIST or sequential 0..N-1
+    if [[ -n "$REPT_GPU_LIST" ]]; then
+        IFS=',' read -ra _GPU_ARRAY <<< "$REPT_GPU_LIST"
+    else
+        _GPU_ARRAY=()
+        for i in $(seq 0 $((REPT_NUM_GPUS - 1))); do _GPU_ARRAY+=("$i"); done
+    fi
+    # Last REPT_VLLM_TP GPUs → vLLM; remainder → training
+    _TRAIN_GPUS=("${_GPU_ARRAY[@]:0:$((${#_GPU_ARRAY[@]} - REPT_VLLM_TP))}")
+    _VLLM_GPUS=("${_GPU_ARRAY[@]:$((${#_GPU_ARRAY[@]} - REPT_VLLM_TP))}")
+    TRAIN_CUDA_DEVS=$(IFS=,; echo "${_TRAIN_GPUS[*]}")
+    VLLM_CUDA_DEVS=$(IFS=,; echo "${_VLLM_GPUS[*]}")
 
     VLLM_CURL_HOST="$REPT_VLLM_SERVER_HOST"
     if [[ "$VLLM_CURL_HOST" == "0.0.0.0" ]]; then
