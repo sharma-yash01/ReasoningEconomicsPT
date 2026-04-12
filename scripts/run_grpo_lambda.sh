@@ -52,6 +52,7 @@ usage() {
     echo "  REPT_NO_BF16          default: 0 (set to 1 for --no_bf16)"
     echo "  REPT_ACCELERATE_MAIN_PORT  optional (default: 29500) for accelerate launch"
     echo "  REPT_MODEL_SHARDING   default: 0 (set to 1 for FSDP via config/accelerate/model-sharding.yaml; requires server mode, TRAIN_PROCS>=2)"
+    echo "  REPT_FSDP2_SHARDING   default: 0 (set to 1 when REPT_MODEL_SHARDING=1 to use model-sharding-fsdp2.yaml if REPT_ACCELERATE_CONFIG unset)"
     echo "  REPT_ACCELERATE_CONFIG optional path to Accelerate YAML (used when REPT_MODEL_SHARDING=1; default: <REPT_ROOT>/config/accelerate/model-sharding.yaml)"
     echo "  REPT_ALPHA            default: 1.0"
     echo "  REPT_LOG_EVERY        default: 1   (log every N weight updates)"
@@ -116,10 +117,11 @@ PYTORCH_WHEEL_INDEX="${PYTORCH_WHEEL_INDEX:-}"
 # REPT_MODEL_SHARDING:
 #   0 = No sharding (default; single-process or DDP as per Accelerate/torch)
 #   1 = Enable FSDP model sharding (leverages Accelerate config for model sharding; reduces memory per GPU, enables training larger models)
-#      Set REPT_MODEL_SHARDING=1 and optionally pass your Accelerate config via REPT_ACCELERATE_CONFIG.
-#      When enabled, uses $REPT_DEFAULT_SHARDING_CONFIG unless overridden.
+#      Set REPT_MODEL_SHARDING=1; template = REPT_ACCELERATE_CONFIG if set, else model-sharding-fsdp2.yaml if REPT_FSDP2_SHARDING=1, else model-sharding.yaml (v1).
 REPT_MODEL_SHARDING="${REPT_MODEL_SHARDING:-0}"
 REPT_DEFAULT_SHARDING_CONFIG="${REPT_ROOT}/config/accelerate/model-sharding.yaml"
+REPT_DEFAULT_SHARDING_CONFIG_FSDP2="${REPT_ROOT}/config/accelerate/model-sharding-fsdp2.yaml"
+REPT_FSDP2_SHARDING="${REPT_FSDP2_SHARDING:-0}"
 # Explicit GPU list (e.g. "4,5,6,7"). When set, overrides REPT_NUM_GPUS auto-detection
 # and uses exactly these physical device IDs for training + vLLM assignment.
 REPT_GPU_LIST="${REPT_GPU_LIST:-}"
@@ -130,6 +132,10 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-720
 
 if [[ "$REPT_MODEL_SHARDING" != "0" && "$REPT_MODEL_SHARDING" != "1" ]]; then
     echo "[ERROR] REPT_MODEL_SHARDING must be 0 or 1 (got: $REPT_MODEL_SHARDING)"
+    exit 1
+fi
+if [[ "$REPT_FSDP2_SHARDING" != "0" && "$REPT_FSDP2_SHARDING" != "1" ]]; then
+    echo "[ERROR] REPT_FSDP2_SHARDING must be 0 or 1 (got: $REPT_FSDP2_SHARDING)"
     exit 1
 fi
 
@@ -279,7 +285,13 @@ if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
     echo "  vLLM max_model_len: $REPT_VLLM_MAX_MODEL_LEN (trl vllm-serve)"
 fi
 if [[ "$REPT_MODEL_SHARDING" == "1" ]]; then
-    echo "  Model sharding:  FSDP (Accelerate; see config/accelerate/model-sharding.yaml)"
+    if [[ -n "${REPT_ACCELERATE_CONFIG:-}" ]]; then
+        echo "  Model sharding:  FSDP (Accelerate; REPT_ACCELERATE_CONFIG=$REPT_ACCELERATE_CONFIG)"
+    elif [[ "$REPT_FSDP2_SHARDING" == "1" ]]; then
+        echo "  Model sharding:  FSDP (Accelerate; template model-sharding-fsdp2.yaml)"
+    else
+        echo "  Model sharding:  FSDP (Accelerate; see config/accelerate/model-sharding.yaml)"
+    fi
 fi
 echo "==============================="
 
@@ -440,7 +452,13 @@ fi
 # ---- FSDP / model sharding (Accelerate --config_file) ----
 REPT_ACCEL_CONFIG_FILE=""
 if [[ "$REPT_MODEL_SHARDING" == "1" ]]; then
-    SHARD_SRC="${REPT_ACCELERATE_CONFIG:-$REPT_DEFAULT_SHARDING_CONFIG}"
+    if [[ -n "${REPT_ACCELERATE_CONFIG:-}" ]]; then
+        SHARD_SRC="$REPT_ACCELERATE_CONFIG"
+    elif [[ "$REPT_FSDP2_SHARDING" == "1" ]]; then
+        SHARD_SRC="$REPT_DEFAULT_SHARDING_CONFIG_FSDP2"
+    else
+        SHARD_SRC="$REPT_DEFAULT_SHARDING_CONFIG"
+    fi
     if [[ ! -f "$SHARD_SRC" ]]; then
         echo "[ERROR] Accelerate config for model sharding not found: $SHARD_SRC"
         exit 1
