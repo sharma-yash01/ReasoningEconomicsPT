@@ -1,6 +1,5 @@
 # Lambda Cloud GPU — pinned stack for GRPO + TRL environment_factory + vLLM.
-# Aligned with impl-context/v2.1-impl.md and cross-chat-completion.md (same versions
-# as requirements.carc-cu121.txt: torch 2.8.* + vLLM 0.10.2 + trl 1.0.0 + transformers>=5.2.0).
+# Gemma 4 needs transformers>=5.5.0 and vllm>=0.15.2 (model_type gemma4).
 #
 # Install (recommended with PyTorch CUDA wheels):
 #   pip install --upgrade pip
@@ -17,16 +16,23 @@ torch==2.8.*
 numpy>=1.26
 
 # ---- Inference / generation ----
-vllm==0.10.2
+vllm>=0.15.2
 
 # ---- Core training stack ----
 openenv-core[core]==0.2.*
 trl==1.0.0
 jmespath>=1.0.1
-# transformers>=5.2.0, <5.4
-transformers==5.3.0
+transformers>=5.5.0
 datasets>=4.7.0
 accelerate>=1.4.0
 
 # ---- Data / config ----
 pydantic>=2.11.7
+
+# ---- Unsloth (optional; grpo_train --use_unsloth) ----
+# Target pins: unsloth==2026.4.4, unsloth_zoo>=2026.4.3 (see unsloth PyPI requires_dist).
+# unsloth caps trl<=0.24 while this file pins trl==1.0.0 — install Unsloth in a second step with --no-deps.
+# After: pip install -r requirements.lambda.txt --extra-index-url https://download.pytorch.org/whl/cu121
+# Then pick an extra matching your CUDA+torch wheels (PyPI has no cu121+torch2.8 extra; e.g. cu128onlytorch280):
+#   pip install "unsloth[cu128onlytorch280]==2026.4.4" "unsloth_zoo>=2026.4.3,<2026.5" --no-deps
+bitsandbytes>=0.45.5,!=0.46.0,!=0.48.0

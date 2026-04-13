@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from training.config import TrainingRuntimeConfig
+from training.unsloth_fsdp import assert_unsloth_compatible_with_fsdp
 from training.model_profiles import (
     ParsedCompletion,
     ResolvedProfile,
@@ -716,7 +717,31 @@ def main():
         choices=["auto", "on", "off"],
         help="Chat-template enable_thinking: auto uses profile JSON; on/off forces True/False.",
     )
+    parser.add_argument(
+        "--use_unsloth",
+        action="store_true",
+        help="Load policy via Unsloth FastLanguageModel + LoRA (VRAM-friendly). Incompatible with FSDP (REPT_MODEL_SHARDING=1).",
+    )
+    parser.add_argument(
+        "--load_in_4bit",
+        action="store_true",
+        help="With --use_unsloth: load base weights in 4-bit (QLoRA-style).",
+    )
+    parser.add_argument(
+        "--lora_r",
+        type=int,
+        default=16,
+        help="LoRA rank when --use_unsloth (default 16).",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=16,
+        help="LoRA alpha when --use_unsloth (default 16).",
+    )
     args = parser.parse_args()
+
+    assert_unsloth_compatible_with_fsdp(args.use_unsloth)
 
     if args.per_device_train_batch_size % args.num_generations != 0:
         raise SystemExit(
@@ -773,6 +798,41 @@ def main():
         * 100
     })
 
+    policy_model: str | Any = args.model
+    if args.use_unsloth:
+        try:
+            from unsloth import FastLanguageModel, PatchFastRL
+        except ImportError as e:
+            raise SystemExit(
+                "Unsloth is not installed. Install with: pip install unsloth"
+            ) from e
+        PatchFastRL("grpo")
+        model, _tokenizer = FastLanguageModel.from_pretrained(
+            model_name=args.model,
+            max_seq_length=args.max_completion_length,
+            dtype="auto",
+            load_in_4bit=args.load_in_4bit,
+        )
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            lora_dropout=0,
+            bias="none",
+            use_gradient_checkpointing=args.gradient_checkpointing,
+            random_state=3407,
+        )
+        policy_model = model
+
     grpo_config = GRPOConfig(
         output_dir=args.output_dir,
         use_vllm=True,
@@ -796,7 +856,7 @@ def main():
     )
 
     trainer = GRPOTrainer(
-        model=args.model,
+        model=policy_model,
         reward_funcs=reward_from_env,
         train_dataset=dataset,
         rollout_func=build_rollout_func(

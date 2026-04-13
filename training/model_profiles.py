@@ -142,6 +142,11 @@ def parse_completion(
         close_tag = think_tag_close or _DEFAULT_QWEN_THINK_CLOSE
         return _parse_qwen_think(text or "", open_tag, close_tag)
 
+    if parser_id == "gemma4_think":
+        open_tag = think_tag_open or "<|channel>thought"
+        close_tag = think_tag_close or "<|/channel>"
+        return _parse_qwen_think(text or "", open_tag, close_tag)
+
     raise ValueError(f"Unknown output_parser: {parser_id!r}")
 
 
@@ -167,15 +172,20 @@ def merge_chat_template_kwargs_for_reasoning_mode(
     *,
     reasoning_mode: str,
 ) -> dict[str, Any]:
-    """Override enable_thinking when reasoning_mode is on or off; auto leaves base unchanged."""
+    """Override thinking-related chat_template kwargs when reasoning_mode is on/off; auto unchanged."""
     mode = (reasoning_mode or "auto").strip().lower()
     out = dict(base)
-    if mode == "on":
-        out["enable_thinking"] = True
-    elif mode == "off":
-        out["enable_thinking"] = False
-    elif mode != "auto":
+    if mode == "auto":
+        return out
+    if mode not in ("on", "off"):
         raise ValueError(f"reasoning_mode must be auto, on, or off (got {reasoning_mode!r})")
+    enabled = mode == "on"
+    if "thinking_mode" in base:
+        out["thinking_mode"] = enabled
+    if "enable_thinking" in base:
+        out["enable_thinking"] = enabled
+    elif "thinking_mode" not in base:
+        out["enable_thinking"] = enabled
     return out
 
 

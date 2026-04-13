@@ -8,13 +8,13 @@ torch==2.8.*
 numpy>=1.26
 
 # ---- Inference / generation ----
-vllm==0.10.2
+vllm>=0.15.2
 
 # ---- Core training stack ----
 openenv-core[core]==0.2.*
 trl==1.0.0
 jmespath>=1.0.1
-transformers>=5.2.0
+transformers>=5.5.0
 datasets>=4.7.0
 accelerate>=1.4.0 
 

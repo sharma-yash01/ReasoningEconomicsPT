@@ -2,12 +2,12 @@
 openenv-core[core]==0.2.*
 trl==1.0.0
 jmespath>=1.0.1
-transformers>=5.2.0
+transformers>=5.5.0
 datasets>=2.21
 accelerate>=1.2
 
 # ---- Inference / generation ----
-vllm>=0.10.2,<0.15
+vllm>=0.15.2
 
 # ---- Deep learning runtime ----
 torch==2.5.*
@@ -15,3 +15,11 @@ numpy==1.26.*
 
 # ---- Data / config ----
 pydantic==2.10.*
+
+# ---- Unsloth (optional; grpo_train --use_unsloth) ----
+# Target pins (PyPI calver, aligned with unsloth 2026.4.4 metadata): unsloth==2026.4.4, unsloth_zoo>=2026.4.3.
+# unsloth/unsloth_zoo declare trl<=0.24 on PyPI; this repo uses trl==1.0.0 — do not mix in one pip resolve.
+# After: pip install -r requirements.txt
+# Then:  pip install "unsloth==2026.4.4" "unsloth_zoo>=2026.4.3,<2026.5" --no-deps
+# Pick a CUDA+torch extra for your wheel stack if needed, e.g. unsloth[cu126onlytorch280]==2026.4.4 --no-deps
+bitsandbytes>=0.45.5,!=0.46.0,!=0.48.0

@@ -50,6 +50,18 @@ class TestMergeReasoningMode(unittest.TestCase):
             ]
         )
 
+    def test_gemma_thinking_mode_on_off(self):
+        self.assertTrue(
+            merge_chat_template_kwargs_for_reasoning_mode({"thinking_mode": True}, reasoning_mode="on")[
+                "thinking_mode"
+            ]
+        )
+        self.assertFalse(
+            merge_chat_template_kwargs_for_reasoning_mode({"thinking_mode": True}, reasoning_mode="off")[
+                "thinking_mode"
+            ]
+        )
+
 
 class TestRegistryResolve(unittest.TestCase):
     def test_longest_prefix_wins(self):
@@ -146,6 +158,12 @@ class TestParseCompletion(unittest.TestCase):
         p = parse_completion(text, "qwen3_think", think_tag_open="<think>", think_tag_close="</think>")
         self.assertEqual(p.reasoning, "only")
         self.assertEqual(p.visible, "")
+
+    def test_gemma4_think_block(self):
+        text = "<|channel>thought\nstep\n<|/channel>\n\n\\boxed{42}"
+        p = parse_completion(text, "gemma4_think")
+        self.assertIn("step", p.reasoning)
+        self.assertIn("42", p.visible)
 
 
 if __name__ == "__main__":

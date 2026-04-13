@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "default": {
     "chat_template_kwargs": {},
     "output_parser": null,
@@ -15,6 +15,30 @@
       "think_tag_open": null,
       "think_tag_close": null,
       "grading_use_visible_only": true
+    },
+    {
+      "match_prefixes": ["deepseek-ai/DeepSeek-R1", "deepseek-ai/DeepSeek-V3"],
+      "chat_template_kwargs": {},
+      "output_parser": "qwen3_think",
+      "think_tag_open": null,
+      "think_tag_close": null,
+      "grading_use_visible_only": true
+    },
+    {
+      "match_prefixes": ["google/gemma-4"],
+      "chat_template_kwargs": { "thinking_mode": true },
+      "output_parser": "gemma4_think",
+      "think_tag_open": "<|channel>thought",
+      "think_tag_close": "<|/channel>",
+      "grading_use_visible_only": true
+    },
+    {
+      "match_prefixes": ["meta-llama/Llama-4", "meta-llama/Llama-3"],
+      "chat_template_kwargs": {},
+      "output_parser": null,
+      "think_tag_open": null,
+      "think_tag_close": null,
+      "grading_use_visible_only": false
     }
   ]
 }

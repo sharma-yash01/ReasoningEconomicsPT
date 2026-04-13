@@ -374,10 +374,10 @@ bash scripts/submit_grpo_carc.sh
 ## Dependency files
 
 - `requirements.txt` — default training dependencies (generic).
-- `requirements.lambda.txt` — Lambda pins (e.g. torch 2.8.*, vLLM 0.10.2, trl 1.0.0, transformers range compatible with vLLM).
+- `requirements.lambda.txt` — Lambda pins (e.g. torch 2.8.*, vLLM ≥0.15.2, trl 1.0.0, transformers ≥5.5 for Gemma 4 / `model_type: gemma4`).
 - `requirements.carc-cu121.txt` — CARC lock file for Discovery CUDA stack.
 
-Use `requirements.lambda.txt` on Lambda instead of loosening `vllm` in `requirements.txt` (avoids pip resolver conflicts with `torch` / `pydantic`). **`transformers`** versions far above the pin may break **`vllm==0.10.2`** at import — see **`cross-chat-completion.md`**.
+Use `requirements.lambda.txt` on Lambda instead of ad-hoc mixing `torch` / `vllm` / `transformers` pins (avoids pip resolver conflicts). **`--use_unsloth`** (optional LoRA path) is incompatible with **`REPT_MODEL_SHARDING=1`** (FSDP); see **`cross-chat-completion.md`** for TRL/vLLM notes.
 
 ---
 
