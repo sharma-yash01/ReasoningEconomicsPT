@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from training.config import TrainingRuntimeConfig
-from training.unsloth_fsdp import assert_unsloth_compatible_with_fsdp
+from training.unsloth_fsdp import is_fsdp_model_sharding_env, warn_unsloth_fsdp_experimental
 from training.model_profiles import (
     ParsedCompletion,
     ResolvedProfile,
@@ -720,7 +720,10 @@ def main():
     parser.add_argument(
         "--use_unsloth",
         action="store_true",
-        help="Load policy via Unsloth FastLanguageModel + LoRA (VRAM-friendly). Incompatible with FSDP (REPT_MODEL_SHARDING=1).",
+        help=(
+            "Load policy via Unsloth FastLanguageModel + LoRA (VRAM-friendly). "
+            "With REPT_MODEL_SHARDING=1, use accelerate launch + FSDP yaml (experimental)."
+        ),
     )
     parser.add_argument(
         "--load_in_4bit",
@@ -741,7 +744,7 @@ def main():
     )
     args = parser.parse_args()
 
-    assert_unsloth_compatible_with_fsdp(args.use_unsloth)
+    warn_unsloth_fsdp_experimental(use_unsloth=args.use_unsloth, load_in_4bit=args.load_in_4bit)
 
     if args.per_device_train_batch_size % args.num_generations != 0:
         raise SystemExit(
@@ -807,12 +810,21 @@ def main():
                 "Unsloth is not installed. Install with: pip install unsloth"
             ) from e
         PatchFastRL("grpo")
-        model, _tokenizer = FastLanguageModel.from_pretrained(
-            model_name=args.model,
-            max_seq_length=args.max_completion_length,
-            dtype="auto",
-            load_in_4bit=args.load_in_4bit,
-        )
+        _fsdp = is_fsdp_model_sharding_env()
+        _from_kw: dict[str, Any] = {
+            "model_name": args.model,
+            "max_seq_length": args.max_completion_length,
+            "dtype": "auto",
+            "load_in_4bit": args.load_in_4bit,
+        }
+        # Align with Accelerate FSDP CPU-efficient load path when sharding (all ranks construct).
+        if _fsdp:
+            _from_kw["low_cpu_mem_usage"] = True
+        try:
+            model, _tokenizer = FastLanguageModel.from_pretrained(**_from_kw)
+        except TypeError:
+            _from_kw.pop("low_cpu_mem_usage", None)
+            model, _tokenizer = FastLanguageModel.from_pretrained(**_from_kw)
         model = FastLanguageModel.get_peft_model(
             model,
             r=args.lora_r,
@@ -831,6 +843,9 @@ def main():
             use_gradient_checkpointing=args.gradient_checkpointing,
             random_state=3407,
         )
+        # PEFT + FSDP: inputs may need grads for checkpoint/wrapped forward (harmless if unused).
+        if _fsdp and hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
         policy_model = model
 
     grpo_config = GRPOConfig(

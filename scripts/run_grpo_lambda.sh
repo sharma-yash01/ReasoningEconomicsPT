@@ -11,6 +11,9 @@
 # Multi-GPU: REPT_VLLM_MODE=auto picks server if >=2 visible GPUs else colocate.
 # Server mode: starts trl vllm-serve on REPT_VLLM_PORT (default 8001), then accelerate launch
 # on the remaining GPUs (OpenEnv typically uses 8000 — do not collide).
+#
+# Unsloth (optional): REPT_USE_UNSLOTH=1 → grpo_train --use_unsloth (+ REPT_UNSLOTH_* below).
+# Install Unsloth after deps: pip install "unsloth[...]==..." "unsloth_zoo>=..." --no-deps (see requirements.lambda.txt).
 
 set -euo pipefail
 
@@ -56,6 +59,10 @@ usage() {
     echo "  REPT_ACCELERATE_CONFIG optional path to Accelerate YAML (used when REPT_MODEL_SHARDING=1; default: <REPT_ROOT>/config/accelerate/model-sharding.yaml)"
     echo "  REPT_ALPHA            default: 1.0"
     echo "  REPT_LOG_EVERY        default: 1   (log every N weight updates)"
+    echo "  REPT_USE_UNSLOTH      default: 0 (set to 1 for grpo_train --use_unsloth; install unsloth per requirements.lambda.txt)"
+    echo "  REPT_UNSLOTH_LOAD_IN_4BIT default: 0 (set to 1 for --load_in_4bit; requires REPT_USE_UNSLOTH=1)"
+    echo "  REPT_UNSLOTH_LORA_R   default: 16  (passed as --lora_r when REPT_USE_UNSLOTH=1)"
+    echo "  REPT_UNSLOTH_LORA_ALPHA default: 16 (passed as --lora_alpha when REPT_USE_UNSLOTH=1)"
     echo "  REPT_INSTALL_DEPS_ON_RUN  default: 0 (set to 1 to pip install before run)"
     echo "  REPT_REQUIREMENTS_FILE    default: <REPT_ROOT>/requirements.lambda.txt"
     echo "  PYTORCH_WHEEL_INDEX       optional pip extra index URL"
@@ -109,6 +116,10 @@ REPT_MAX_COMPLETION_LENGTH="${REPT_MAX_COMPLETION_LENGTH:-4096}"
 REPT_NO_BF16="${REPT_NO_BF16:-0}"
 REPT_ALPHA="${REPT_ALPHA:-1.0}"
 REPT_LOG_EVERY="${REPT_LOG_EVERY:-1}"
+REPT_USE_UNSLOTH="${REPT_USE_UNSLOTH:-0}"
+REPT_UNSLOTH_LOAD_IN_4BIT="${REPT_UNSLOTH_LOAD_IN_4BIT:-0}"
+REPT_UNSLOTH_LORA_R="${REPT_UNSLOTH_LORA_R:-16}"
+REPT_UNSLOTH_LORA_ALPHA="${REPT_UNSLOTH_LORA_ALPHA:-16}"
 REPT_INSTALL_DEPS_ON_RUN="${REPT_INSTALL_DEPS_ON_RUN:-0}"
 REPT_REQUIREMENTS_FILE="${REPT_REQUIREMENTS_FILE:-$REPT_ROOT/requirements.lambda.txt}"
 PYTORCH_WHEEL_INDEX="${PYTORCH_WHEEL_INDEX:-}"
@@ -119,6 +130,7 @@ PYTORCH_WHEEL_INDEX="${PYTORCH_WHEEL_INDEX:-}"
 #   1 = Enable FSDP model sharding (leverages Accelerate config for model sharding; reduces memory per GPU, enables training larger models)
 #      Set REPT_MODEL_SHARDING=1; template = REPT_ACCELERATE_CONFIG if set, else model-sharding-fsdp2.yaml if REPT_FSDP2_SHARDING=1, else model-sharding.yaml (v1).
 REPT_MODEL_SHARDING="${REPT_MODEL_SHARDING:-0}"
+export REPT_MODEL_SHARDING
 REPT_DEFAULT_SHARDING_CONFIG="${REPT_ROOT}/config/accelerate/model-sharding.yaml"
 REPT_DEFAULT_SHARDING_CONFIG_FSDP2="${REPT_ROOT}/config/accelerate/model-sharding-fsdp2.yaml"
 REPT_FSDP2_SHARDING="${REPT_FSDP2_SHARDING:-0}"
@@ -136,6 +148,27 @@ if [[ "$REPT_MODEL_SHARDING" != "0" && "$REPT_MODEL_SHARDING" != "1" ]]; then
 fi
 if [[ "$REPT_FSDP2_SHARDING" != "0" && "$REPT_FSDP2_SHARDING" != "1" ]]; then
     echo "[ERROR] REPT_FSDP2_SHARDING must be 0 or 1 (got: $REPT_FSDP2_SHARDING)"
+    exit 1
+fi
+
+if [[ "$REPT_USE_UNSLOTH" != "0" && "$REPT_USE_UNSLOTH" != "1" ]]; then
+    echo "[ERROR] REPT_USE_UNSLOTH must be 0 or 1 (got: $REPT_USE_UNSLOTH)"
+    exit 1
+fi
+if [[ "$REPT_UNSLOTH_LOAD_IN_4BIT" != "0" && "$REPT_UNSLOTH_LOAD_IN_4BIT" != "1" ]]; then
+    echo "[ERROR] REPT_UNSLOTH_LOAD_IN_4BIT must be 0 or 1 (got: $REPT_UNSLOTH_LOAD_IN_4BIT)"
+    exit 1
+fi
+if [[ "$REPT_UNSLOTH_LOAD_IN_4BIT" == "1" && "$REPT_USE_UNSLOTH" != "1" ]]; then
+    echo "[ERROR] REPT_UNSLOTH_LOAD_IN_4BIT=1 requires REPT_USE_UNSLOTH=1"
+    exit 1
+fi
+if ! [[ "$REPT_UNSLOTH_LORA_R" =~ ^[0-9]+$ ]] || [[ "$REPT_UNSLOTH_LORA_R" -lt 1 ]]; then
+    echo "[ERROR] REPT_UNSLOTH_LORA_R must be a positive integer (got: $REPT_UNSLOTH_LORA_R)"
+    exit 1
+fi
+if ! [[ "$REPT_UNSLOTH_LORA_ALPHA" =~ ^[0-9]+$ ]] || [[ "$REPT_UNSLOTH_LORA_ALPHA" -lt 1 ]]; then
+    echo "[ERROR] REPT_UNSLOTH_LORA_ALPHA must be a positive integer (got: $REPT_UNSLOTH_LORA_ALPHA)"
     exit 1
 fi
 
@@ -293,6 +326,12 @@ if [[ "$REPT_MODEL_SHARDING" == "1" ]]; then
         echo "  Model sharding:  FSDP (Accelerate; see config/accelerate/model-sharding.yaml)"
     fi
 fi
+if [[ "$REPT_USE_UNSLOTH" == "1" ]]; then
+    echo "  Unsloth:         enabled (--use_unsloth; LoRA r=$REPT_UNSLOTH_LORA_R alpha=$REPT_UNSLOTH_LORA_ALPHA)"
+    if [[ "$REPT_UNSLOTH_LOAD_IN_4BIT" == "1" ]]; then
+        echo "  Unsloth 4-bit:   --load_in_4bit"
+    fi
+fi
 echo "==============================="
 
 # ------------------------------------------------------------------ dependency precheck
@@ -306,6 +345,17 @@ for mod in torch vllm trl transformers datasets huggingface_hub openenv jmespath
         exit 1
     fi
 done
+
+if [[ "$REPT_USE_UNSLOTH" == "1" ]]; then
+    if python -c "import unsloth" >/dev/null 2>&1; then
+        echo "  [PASS] import unsloth"
+    else
+        echo "  [FAIL] import unsloth (REPT_USE_UNSLOTH=1)"
+        echo "Install Unsloth after main deps, e.g.: pip install \"unsloth[cu128onlytorch280]==2026.4.4\" \"unsloth_zoo>=2026.4.3,<2026.5\" --no-deps"
+        echo "See comments in requirements.lambda.txt for CUDA/torch extras."
+        exit 1
+    fi
+fi
 
 if [[ "$REPT_VLLM_MODE" == "server" ]]; then
     if ! command -v accelerate >/dev/null 2>&1; then
@@ -447,6 +497,13 @@ fi
 
 if [[ "${REPT_NO_BF16:-0}" == "1" ]]; then
     COMMON_ARGS+=(--no_bf16)
+fi
+
+if [[ "$REPT_USE_UNSLOTH" == "1" ]]; then
+    COMMON_ARGS+=(--use_unsloth --lora_r "$REPT_UNSLOTH_LORA_R" --lora_alpha "$REPT_UNSLOTH_LORA_ALPHA")
+    if [[ "$REPT_UNSLOTH_LOAD_IN_4BIT" == "1" ]]; then
+        COMMON_ARGS+=(--load_in_4bit)
+    fi
 fi
 
 # ---- FSDP / model sharding (Accelerate --config_file) ----

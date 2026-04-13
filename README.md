@@ -190,6 +190,10 @@ If TRL hits **404** on **`/get_world_size/`**, the client is usually pointed at 
 | `REPT_MAX_COMPLETION_LENGTH` | `4096` | |
 | `REPT_GRADIENT_CHECKPOINTING` | `1` | Set `0` to omit `--gradient_checkpointing` |
 | `REPT_NO_BF16` | `0` | Set `1` for `--no_bf16` |
+| `REPT_USE_UNSLOTH` | `0` | Set **`1`** for **`--use_unsloth`** (install Unsloth per **`requirements.lambda.txt`**) |
+| `REPT_UNSLOTH_LOAD_IN_4BIT` | `0` | Set **`1`** for **`--load_in_4bit`** (requires **`REPT_USE_UNSLOTH=1`**) |
+| `REPT_UNSLOTH_LORA_R` | `16` | **`--lora_r`** when Unsloth enabled |
+| `REPT_UNSLOTH_LORA_ALPHA` | `16` | **`--lora_alpha`** when Unsloth enabled |
 | `REPT_ACCELERATE_MAIN_PORT` | `29500` | If port busy, change or use `0` |
 | `REPT_MODEL_SHARDING` | `0` | Set **`1`** for FSDP via **`config/accelerate/model-sharding.yaml`** (**server** mode, **`TRAIN_PROCS` ≥ 2**) |
 | `REPT_ACCELERATE_CONFIG` | unset | When **`REPT_MODEL_SHARDING=1`**, source Accelerate YAML (default: **`$REPT_ROOT/config/accelerate/model-sharding.yaml`**); **`num_processes`** is overwritten at launch |
@@ -202,7 +206,7 @@ If TRL hits **404** on **`/get_world_size/`**, the client is usually pointed at 
 |----------|--------|
 | `HF_TOKEN` | Higher Hub rate limits for downloads |
 
-The launcher passes a **fixed subset** of `grpo_train` flags (see **`scripts/run_grpo_lambda.sh`** `COMMON_ARGS`). Arguments **not** wired there (e.g. `--reasoning_mode`, `--env_total_budget`, `--model_profiles_path`) require **`python -m training.grpo_train`** directly or extending the script.
+The launcher passes a **fixed subset** of `grpo_train` flags (see **`scripts/run_grpo_lambda.sh`** `COMMON_ARGS`), including **Unsloth** via **`REPT_USE_UNSLOTH`** / **`REPT_UNSLOTH_*`**. Arguments **not** wired there (e.g. `--reasoning_mode`, `--env_total_budget`, `--model_profiles_path`) require **`python -m training.grpo_train`** directly or extending the script.
 
 ### Canonical Lambda execution process
 
@@ -233,6 +237,11 @@ unset CUDA_VISIBLE_DEVICES
 export REPT_NUM_GPUS=auto
 export REPT_VLLM_MODE=auto
 export REPT_VLLM_TP=1
+# Optional Unsloth (install unsloth per requirements.lambda.txt, then):
+# export REPT_USE_UNSLOTH=1
+# export REPT_UNSLOTH_LOAD_IN_4BIT=1
+# export REPT_UNSLOTH_LORA_R=16
+# export REPT_UNSLOTH_LORA_ALPHA=16
 # Server mode (auto with ≥2 GPUs): run_grpo_lambda.sh starts trl vllm-serve on REPT_VLLM_PORT (default 8001),
 # not OpenEnv’s 8000. See cross-chat-completion.md § vLLM HTTP 404 and impl-context/v2.2-impl.md erratum.
 
@@ -377,7 +386,7 @@ bash scripts/submit_grpo_carc.sh
 - `requirements.lambda.txt` — Lambda pins (e.g. torch 2.8.*, vLLM ≥0.15.2, trl 1.0.0, transformers ≥5.5 for Gemma 4 / `model_type: gemma4`).
 - `requirements.carc-cu121.txt` — CARC lock file for Discovery CUDA stack.
 
-Use `requirements.lambda.txt` on Lambda instead of ad-hoc mixing `torch` / `vllm` / `transformers` pins (avoids pip resolver conflicts). **`--use_unsloth`** (optional LoRA path) is incompatible with **`REPT_MODEL_SHARDING=1`** (FSDP); see **`cross-chat-completion.md`** for TRL/vLLM notes.
+Use `requirements.lambda.txt` on Lambda instead of ad-hoc mixing `torch` / `vllm` / `transformers` pins (avoids pip resolver conflicts). **`--use_unsloth`** with **`REPT_MODEL_SHARDING=1`** (FSDP via `accelerate launch`) is **experimental**; see **`cross-chat-completion.md`** for TRL/vLLM notes.
 
 ---
 

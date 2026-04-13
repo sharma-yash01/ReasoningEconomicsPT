@@ -242,6 +242,46 @@ if [[ -n "${REPT_VENV:-}" && -f "$REPT_VENV/bin/python" ]]; then
             pass "GPU layout allows TRAIN_PROCS=$TRAIN_PROCS_CHECK for FSDP"
         fi
     fi
+
+    REPT_USE_UNSLOTH="${REPT_USE_UNSLOTH:-0}"
+    REPT_UNSLOTH_LOAD_IN_4BIT="${REPT_UNSLOTH_LOAD_IN_4BIT:-0}"
+    REPT_UNSLOTH_LORA_R="${REPT_UNSLOTH_LORA_R:-16}"
+    REPT_UNSLOTH_LORA_ALPHA="${REPT_UNSLOTH_LORA_ALPHA:-16}"
+    echo ""
+    echo "--- Unsloth (optional) ---"
+    if [[ "$REPT_UNSLOTH_LOAD_IN_4BIT" != "0" && "$REPT_UNSLOTH_LOAD_IN_4BIT" != "1" ]]; then
+        fail "REPT_UNSLOTH_LOAD_IN_4BIT must be 0 or 1 (got: $REPT_UNSLOTH_LOAD_IN_4BIT)"
+    fi
+    if [[ "$REPT_UNSLOTH_LOAD_IN_4BIT" == "1" && "$REPT_USE_UNSLOTH" != "1" ]]; then
+        fail "REPT_UNSLOTH_LOAD_IN_4BIT=1 requires REPT_USE_UNSLOTH=1"
+    fi
+    if [[ "$REPT_USE_UNSLOTH" != "0" && "$REPT_USE_UNSLOTH" != "1" ]]; then
+        fail "REPT_USE_UNSLOTH must be 0 or 1 (got: $REPT_USE_UNSLOTH)"
+    elif [[ "$REPT_USE_UNSLOTH" == "1" ]]; then
+        pass "REPT_USE_UNSLOTH=1 (matches run_grpo_lambda.sh → --use_unsloth)"
+        if [[ "$REPT_UNSLOTH_LOAD_IN_4BIT" != "0" && "$REPT_UNSLOTH_LOAD_IN_4BIT" != "1" ]]; then
+            fail "REPT_UNSLOTH_LOAD_IN_4BIT must be 0 or 1 (got: $REPT_UNSLOTH_LOAD_IN_4BIT)"
+        elif [[ "$REPT_UNSLOTH_LOAD_IN_4BIT" == "1" ]]; then
+            pass "REPT_UNSLOTH_LOAD_IN_4BIT=1 → --load_in_4bit"
+        fi
+        if ! [[ "$REPT_UNSLOTH_LORA_R" =~ ^[0-9]+$ ]] || [[ "$REPT_UNSLOTH_LORA_R" -lt 1 ]]; then
+            fail "REPT_UNSLOTH_LORA_R must be a positive integer (got: $REPT_UNSLOTH_LORA_R)"
+        else
+            pass "REPT_UNSLOTH_LORA_R=$REPT_UNSLOTH_LORA_R"
+        fi
+        if ! [[ "$REPT_UNSLOTH_LORA_ALPHA" =~ ^[0-9]+$ ]] || [[ "$REPT_UNSLOTH_LORA_ALPHA" -lt 1 ]]; then
+            fail "REPT_UNSLOTH_LORA_ALPHA must be a positive integer (got: $REPT_UNSLOTH_LORA_ALPHA)"
+        else
+            pass "REPT_UNSLOTH_LORA_ALPHA=$REPT_UNSLOTH_LORA_ALPHA"
+        fi
+        if "$VENV_PY" -c "import unsloth" >/dev/null 2>&1; then
+            pass "import unsloth"
+        else
+            fail "import unsloth failed (install per requirements.lambda.txt second-step pip line)"
+        fi
+    else
+        pass "REPT_USE_UNSLOTH=0 (standard HF model id path)"
+    fi
 else
     fail "Cannot run Python checks because REPT_VENV python is unavailable"
 fi
