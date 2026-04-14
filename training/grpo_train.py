@@ -271,21 +271,13 @@ class EpisodeSession:
             "model_response": response,
             "raw_step_reward": raw_step_reward,
             "scaled_step_reward": step_reward,
+            "questions_remaining_after": self._obs.get("questions_remaining") if self._obs else None,
+            "remaining_budget_after": self._obs.get("remaining_budget") if self._obs else None,
             "done_after_step": self.done,
         }
         if log_extras:
             entry.update(log_extras)
         self.step_logs.append(entry)
-
-        if self.done:
-            _write_episode_log({
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "episode_id": self.episode_id,
-                "episode_reward": self.reward,
-                "num_steps": len(self.step_logs),
-                "steps": self.step_logs,
-                "final_observation": self._obs,
-            })
 
 
 # ---------------------------------------------------------------------------
@@ -389,11 +381,14 @@ def _rollout_one_episode(
             tools=tools,
             add_generation_prompt=True,
         )
+        initial_questions_remaining = int(obs.get("questions_remaining", 0))
 
         completion_ids: list[int] = []
         env_mask: list[int] = []
         logprob_seq: list[float] = []
         turns = 0
+        any_step_hit_generation_cap = False
+        termination_reason = "max_episode_turns"
 
         while not session.done and turns < max_episode_turns:
             turns += 1
@@ -418,6 +413,8 @@ def _rollout_one_episode(
             gen_lp = _squeeze_vllm_logprobs(logprobs_raw)
             if gen_lp is None or len(gen_lp) != len(gen_ids):
                 gen_lp = [0.0] * len(gen_ids)
+            step_hit_generation_cap = len(gen_ids) == step_cap
+            any_step_hit_generation_cap = any_step_hit_generation_cap or step_hit_generation_cap
 
             completion_ids.extend(gen_ids)
             env_mask.extend([1] * len(gen_ids))
@@ -433,9 +430,21 @@ def _rollout_one_episode(
                     "reasoning_trace": _truncate_for_log(parsed.reasoning) if parsed.reasoning else "",
                     "visible_response": _truncate_for_log(parsed.visible),
                 }
+            if log_extras is None:
+                log_extras = {}
+            log_extras.update(
+                {
+                    "step_completion_tokens": len(gen_ids),
+                    "step_max_tokens": step_cap,
+                    "step_hit_generation_cap": step_hit_generation_cap,
+                    "completion_tokens_so_far": int(sum(env_mask)),
+                    "remaining_rollout_after_step": int(trainer.args.max_completion_length) - len(completion_ids),
+                }
+            )
             session.apply_response(text, step_metadata=step_md, log_extras=log_extras)
 
             if session.done:
+                termination_reason = "env_done"
                 break
 
             after_asst_ids = _tokenize_messages(
@@ -461,6 +470,33 @@ def _rollout_one_episode(
             completion_ids.extend(suffix)
             env_mask.extend([0] * len(suffix))
             logprob_seq.extend([0.0] * len(suffix))
+
+        final_observation = session._obs or {}
+        final_questions_remaining = int(final_observation.get("questions_remaining", 0))
+        questions_completed = max(0, initial_questions_remaining - final_questions_remaining)
+        _write_episode_log(
+            {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "event": "episode_end",
+                "episode_id": session.episode_id,
+                "episode_reward": session.reward,
+                "episode_weighted_reward": session.reward,
+                "num_steps": len(session.step_logs),
+                "num_steps_executed": len(session.step_logs),
+                "steps": session.step_logs,
+                "final_observation": final_observation,
+                "initial_questions_remaining": initial_questions_remaining,
+                "final_questions_remaining": final_questions_remaining,
+                "questions_completed": questions_completed,
+                "total_completion_tokens": int(sum(env_mask)),
+                "total_tokens_serialized": len(completion_ids),
+                "prompt_tokens": len(prompt_ids_fixed),
+                "any_step_hit_generation_cap": any_step_hit_generation_cap,
+                "episode_clipped": termination_reason in {"max_episode_turns"},
+                "termination_reason": termination_reason,
+                "max_completion_length": int(trainer.args.max_completion_length),
+            }
+        )
 
         return prompt_ids_fixed, completion_ids, logprob_seq, env_mask, float(session.reward)
 
