@@ -811,10 +811,11 @@ def main():
             ) from e
         PatchFastRL("grpo")
         _fsdp = is_fsdp_model_sharding_env()
+        # Unsloth FastLanguageModel rejects dtype="auto" (only None, fp16, bf16, fp32).
         _from_kw: dict[str, Any] = {
             "model_name": args.model,
             "max_seq_length": args.max_completion_length,
-            "dtype": "auto",
+            "dtype": torch.bfloat16 if not args.no_bf16 else torch.float16,
             "load_in_4bit": args.load_in_4bit,
         }
         # Align with Accelerate FSDP CPU-efficient load path when sharding (all ranks construct).
