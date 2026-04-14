@@ -12,11 +12,11 @@
 #   bash scripts/bootstrap_lambda.sh
 
 # ---- Deep learning runtime ----
-torch==2.10.*
+torch==2.8.*
 numpy>=1.26
 
 # ---- Inference / generation ----
-vllm==0.17.1
+vllm==0.10.2
 
 # ---- Core training stack ----
 openenv-core[core]==0.2.*
