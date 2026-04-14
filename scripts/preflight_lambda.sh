@@ -282,6 +282,25 @@ if [[ -n "${REPT_VENV:-}" && -f "$REPT_VENV/bin/python" ]]; then
     else
         pass "REPT_USE_UNSLOTH=0 (standard HF model id path)"
     fi
+
+    if [[ -n "${REPT_GRPO_CONFIG_JSON:-}" || -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
+        echo ""
+        echo "--- GRPO / vLLM runtime overrides ---"
+        if [[ -n "${REPT_GRPO_CONFIG_JSON:-}" ]]; then
+            if [[ -f "$REPT_GRPO_CONFIG_JSON" ]]; then
+                pass "REPT_GRPO_CONFIG_JSON exists (--grpo_config_json)"
+            else
+                fail "REPT_GRPO_CONFIG_JSON not a file: $REPT_GRPO_CONFIG_JSON"
+            fi
+        fi
+        if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
+            if [[ "$REPT_VLLM_MAX_MODEL_LEN" =~ ^[0-9]+$ ]] && [[ "$REPT_VLLM_MAX_MODEL_LEN" -ge 1 ]]; then
+                pass "REPT_VLLM_MAX_MODEL_LEN=$REPT_VLLM_MAX_MODEL_LEN (→ --vllm_max_model_length in colocate)"
+            else
+                fail "REPT_VLLM_MAX_MODEL_LEN must be a positive integer (got: $REPT_VLLM_MAX_MODEL_LEN)"
+            fi
+        fi
+    fi
 else
     fail "Cannot run Python checks because REPT_VENV python is unavailable"
 fi

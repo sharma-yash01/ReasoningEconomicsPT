@@ -7,6 +7,7 @@ import copy
 import json
 import threading
 import warnings
+from dataclasses import fields
 
 import torch
 import torch.distributed as dist
@@ -608,6 +609,29 @@ def reward_from_env(prompts, completions, completion_ids, **kwargs):
     return [0.0] * len(prompts)
 
 
+def _merge_grpo_kwargs_from_json(grpo_config_cls: Any, base_kwargs: dict[str, Any], json_path: str | None) -> dict[str, Any]:
+    """Shallow-merge JSON overrides into kwargs; keys must be valid ``trl.GRPOConfig`` field names."""
+    merged = dict(base_kwargs)
+    if not json_path:
+        return merged
+    path = Path(json_path)
+    if not path.is_file():
+        raise SystemExit(f"--grpo_config_json is not a file: {path}")
+    overrides = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(overrides, dict):
+        raise SystemExit("--grpo_config_json root must be a JSON object")
+    valid = {f.name for f in fields(grpo_config_cls)}
+    unknown = sorted(set(overrides) - valid)
+    if unknown:
+        raise SystemExit(
+            "Unknown key(s) in --grpo_config_json (not trl.GRPOConfig fields): "
+            + ", ".join(unknown[:80])
+            + (" ..." if len(unknown) > 80 else "")
+        )
+    merged.update(overrides)
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -646,7 +670,16 @@ def main():
         "--vllm_gpu_memory_utilization",
         type=float,
         default=0.9,
-        help="GPU memory fraction for vLLM (server mode).",
+        help="GPU memory fraction for vLLM (colocate; also passed to trl vllm-serve in server mode).",
+    )
+    parser.add_argument(
+        "--vllm_max_model_length",
+        type=int,
+        default=None,
+        help=(
+            "Max context length (tokens) for the colocated vLLM engine (trl.GRPOConfig.vllm_max_model_length). "
+            "If unset, TRL infers from the model config (often very large). Set to cap KV cache (e.g. 8192)."
+        ),
     )
     parser.add_argument(
         "--vllm_server_host",
@@ -741,6 +774,16 @@ def main():
         type=int,
         default=16,
         help="LoRA alpha when --use_unsloth (default 16).",
+    )
+    parser.add_argument(
+        "--grpo_config_json",
+        type=str,
+        default=None,
+        help=(
+            "Path to a JSON object of trl.GRPOConfig fields (includes TrainingArguments). "
+            "Merged after CLI defaults; keys must match dataclass field names. "
+            "Use for any knob not exposed as a dedicated flag (e.g. vllm_enable_sleep_mode, loss_type)."
+        ),
     )
     args = parser.parse_args()
 
@@ -849,27 +892,32 @@ def main():
             model.enable_input_require_grads()
         policy_model = model
 
-    grpo_config = GRPOConfig(
-        output_dir=args.output_dir,
-        use_vllm=True,
-        vllm_mode=args.vllm_mode,
-        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
-        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-        vllm_server_host=args.vllm_server_host,
-        vllm_server_port=args.vllm_server_port,
-        vllm_group_port=args.vllm_group_port,
-        num_train_epochs=args.num_train_epochs,
-        num_generations=args.num_generations,
-        max_completion_length=args.max_completion_length,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        gradient_checkpointing=args.gradient_checkpointing,
-        bf16=not args.no_bf16,
-        logging_steps=1,
-        save_strategy="epoch",
-        chat_template_kwargs=merged_chat_template_kwargs,
-    )
+    grpo_kwargs: dict[str, Any] = {
+        "output_dir": args.output_dir,
+        "use_vllm": True,
+        "vllm_mode": args.vllm_mode,
+        "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
+        "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+        "vllm_max_model_length": args.vllm_max_model_length,
+        "vllm_server_host": args.vllm_server_host,
+        "vllm_server_port": args.vllm_server_port,
+        "vllm_group_port": args.vllm_group_port,
+        "num_train_epochs": args.num_train_epochs,
+        "num_generations": args.num_generations,
+        "max_completion_length": args.max_completion_length,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "bf16": not args.no_bf16,
+        "logging_steps": 1,
+        "save_strategy": "epoch",
+        "chat_template_kwargs": merged_chat_template_kwargs,
+    }
+
+    grpo_kwargs = _merge_grpo_kwargs_from_json(GRPOConfig, grpo_kwargs, args.grpo_config_json)
+
+    grpo_config = GRPOConfig(**grpo_kwargs)
 
     trainer = GRPOTrainer(
         model=policy_model,

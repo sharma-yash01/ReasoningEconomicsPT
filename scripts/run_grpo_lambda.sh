@@ -49,7 +49,8 @@ usage() {
     echo "  REPT_VLLM_SERVER_HOST default: 127.0.0.1 (passed to grpo_train --vllm_server_host)"
     echo "  REPT_NCCL_P2P_DISABLE optional: if set, overrides NCCL_P2P_DISABLE for multi-GPU (else 1; use 0 on NVLink A100)"
     echo "  REPT_VLLM_GPU_UTIL    default: 0.9"
-    echo "  REPT_VLLM_MAX_MODEL_LEN optional: positive int → trl vllm-serve --max_model_len (server mode only; caps KV / context)"
+    echo "  REPT_VLLM_MAX_MODEL_LEN optional: positive int → --vllm_max_model_length (colocate KV cap) and trl vllm-serve --max_model_len (server)"
+    echo "  REPT_GRPO_CONFIG_JSON optional: path to JSON of trl.GRPOConfig / TrainingArguments fields (merged after CLI defaults)"
     echo "  REPT_GRADIENT_CHECKPOINTING  default: 1"
     echo "  REPT_MAX_COMPLETION_LENGTH   default: 4096"
     echo "  REPT_NO_BF16          default: 0 (set to 1 for --no_bf16)"
@@ -177,6 +178,10 @@ if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
         echo "[ERROR] REPT_VLLM_MAX_MODEL_LEN must be a positive integer (got: $REPT_VLLM_MAX_MODEL_LEN)"
         exit 1
     fi
+fi
+if [[ -n "${REPT_GRPO_CONFIG_JSON:-}" ]] && [[ ! -f "$REPT_GRPO_CONFIG_JSON" ]]; then
+    echo "[ERROR] REPT_GRPO_CONFIG_JSON must be a readable file (got: $REPT_GRPO_CONFIG_JSON)"
+    exit 1
 fi
 
 # ---- GPU fleet & vLLM mode ----
@@ -315,7 +320,10 @@ echo "  Grad accum:      $REPT_GRAD_ACCUM"
 echo "  Output dir:      $REPT_OUTPUT_DIR"
 echo "  Env URL:         $ENV_BASE_URL"
 if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
-    echo "  vLLM max_model_len: $REPT_VLLM_MAX_MODEL_LEN (trl vllm-serve)"
+    echo "  vLLM max context:  $REPT_VLLM_MAX_MODEL_LEN tokens (--vllm_max_model_length; server: also trl vllm-serve --max_model_len)"
+fi
+if [[ -n "${REPT_GRPO_CONFIG_JSON:-}" ]]; then
+    echo "  GRPO JSON merge:   $REPT_GRPO_CONFIG_JSON (--grpo_config_json)"
 fi
 if [[ "$REPT_MODEL_SHARDING" == "1" ]]; then
     if [[ -n "${REPT_ACCELERATE_CONFIG:-}" ]]; then
@@ -487,6 +495,12 @@ COMMON_ARGS=(
     --max_completion_length "$REPT_MAX_COMPLETION_LENGTH"
     --output_dir "$REPT_OUTPUT_DIR"
 )
+if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
+    COMMON_ARGS+=(--vllm_max_model_length "$REPT_VLLM_MAX_MODEL_LEN")
+fi
+if [[ -n "${REPT_GRPO_CONFIG_JSON:-}" ]]; then
+    COMMON_ARGS+=(--grpo_config_json "$REPT_GRPO_CONFIG_JSON")
+fi
 if [[ -n "$ENV_TOKENIZER_ARG" ]]; then
     COMMON_ARGS+=(--env_tokenizer_name "$ENV_TOKENIZER_ARG")
 fi
