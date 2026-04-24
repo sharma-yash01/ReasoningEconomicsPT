@@ -1,5 +1,5 @@
 #!/bin/bash
-# run_grpo_lambda.sh -- Direct GRPO launcher for Lambda Cloud VMs (no Slurm).
+# run_grpo_lambda.sh: Direct GRPO launcher for Lambda Cloud VMs (no Slurm).
 #
 # Usage:
 #   export REPT_ROOT=/home/ubuntu/ReasoningEconomicsPT
@@ -8,9 +8,13 @@
 #   export REPT_FS_NAME=<lambda-filesystem-name>   # optional
 #   bash scripts/run_grpo_lambda.sh [--dry-run]
 #
-# Multi-GPU: REPT_VLLM_MODE=auto picks server if >=2 visible GPUs else colocate.
-# Server mode: starts trl vllm-serve on REPT_VLLM_PORT (default 8001), then accelerate launch
-# on the remaining GPUs (OpenEnv typically uses 8000 — do not collide).
+# Multi GPU: REPT_VLLM_MODE=auto picks server mode when at least two GPUs are visible.
+# Server mode starts trl vllm-serve on REPT_VLLM_PORT (default 8001), then
+# runs accelerate on the remaining GPUs. OpenEnv typically uses 8000, so do not collide.
+#
+# The extra REPT_* switches below are the knobs we used for the 14B Lambda runs:
+# prompt count, rollout length, reward/debug paths, sharding, save behavior,
+# and the env step failure penalty.
 
 set -euo pipefail
 
@@ -31,6 +35,7 @@ usage() {
     echo "  REPT_DATA_ROOT        Base data path (default: /lambda/nfs/<fs>/rept or /lambda/nfs/rept)"
     echo "  REPT_MODEL            default: Qwen/Qwen3-8B (Hub id → prefetched to \$DATA_ROOT/models/...; same id → OpenEnv tokenizer)"
     echo "  REPT_OUTPUT_DIR       default: <DATA_ROOT>/runs/grpo_train_lambda"
+    echo "  REPT_N_PROMPTS        default: 100 (synthetic rollout prompts per epoch)"
     echo "  REPT_NUM_EPOCHS       default: 1"
     echo "  REPT_NUM_GENERATIONS  default: 8"
     echo "  REPT_BATCH_SIZE       default: 8 (must divide evenly by REPT_NUM_GENERATIONS)"
@@ -38,15 +43,19 @@ usage() {
     echo "  REPT_GRAD_ACCUM_OVERRIDE  set to any value to skip grad-accum auto-tune"
     echo "  REPT_NUM_GPUS         default: auto (nvidia-smi count)"
     echo "  REPT_VLLM_MODE        default: auto (server if >=2 GPUs, else colocate)"
-    echo "  REPT_VLLM_TP          default: 1 (vLLM tensor parallel GPUs in server mode)"
+    echo "  REPT_VLLM_TP          default: 1 (vLLM tensor parallel GPUs)"
+    echo "  REPT_COLOCATE_TRAIN_PROCS  default: 1 (experimental: >1 uses accelerate in colocate mode)"
     echo "  REPT_VLLM_PORT        default: 8001 (trl vllm-serve HTTP; must differ from OpenEnv, often 8000)"
     echo "  REPT_VLLM_GROUP_PORT  default: 51216 (TRL weight-sync TCP; match training --vllm_group_port)"
     echo "  REPT_VLLM_SERVER_HOST default: 127.0.0.1 (passed to grpo_train --vllm_server_host)"
     echo "  REPT_NCCL_P2P_DISABLE optional: if set, overrides NCCL_P2P_DISABLE for multi-GPU (else 1; use 0 on NVLink A100)"
     echo "  REPT_VLLM_GPU_UTIL    default: 0.9"
-    echo "  REPT_VLLM_MAX_MODEL_LEN optional: positive int → trl vllm-serve --max_model_len (server mode only; caps KV / context)"
+    echo "  REPT_VLLM_MAX_MODEL_LEN optional: positive int → caps vLLM context/KV"
+    echo "  REPT_VLLM_EXTRA_ARGS optional extra args for trl vllm-serve, e.g. '--enforce-eager True'"
     echo "  REPT_GRADIENT_CHECKPOINTING  default: 1"
     echo "  REPT_MAX_COMPLETION_LENGTH   default: 4096"
+    echo "  REPT_MAX_EPISODE_TURNS       default: 256"
+    echo "  REPT_MAX_STEPS       optional: override computed Trainer max_steps"
     echo "  REPT_NO_BF16          default: 0 (set to 1 for --no_bf16)"
     echo "  REPT_ACCELERATE_MAIN_PORT  optional (default: 29500) for accelerate launch"
     echo "  REPT_ALPHA            default: 1.0"
@@ -54,6 +63,20 @@ usage() {
     echo "  REPT_INSTALL_DEPS_ON_RUN  default: 0 (set to 1 to pip install before run)"
     echo "  REPT_REQUIREMENTS_FILE    default: <REPT_ROOT>/requirements.lambda.txt"
     echo "  PYTORCH_WHEEL_INDEX       optional pip extra index URL"
+    echo "  REPT_MAX_TOKENS_PER_STEP  default: REPT_MAX_COMPLETION_LENGTH"
+    echo "  REPT_DEFAULT_BUDGET_MODE  default: soft"
+    echo "  REPT_REWARD_LOG_PATH  default: <REPT_OUTPUT_DIR>/reward_log.jsonl"
+    echo "  REPT_DEBUG_ROLLOUT    default: 0 (set to 1 for per-turn rollout debug logs)"
+    echo "  REPT_ROLLOUT_DEBUG_PATH default: <REPT_OUTPUT_DIR>/rollout_debug.jsonl"
+    echo "  REPT_SHARDING_BACKEND       default: none (fsdp | deepspeed | none)"
+    echo "  REPT_FSDP_SHARDING_STRATEGY default: FULL_SHARD"
+    echo "  REPT_FSDP_AUTO_WRAP_LAYER   default: Qwen3DecoderLayer"
+    echo "  REPT_DEEPSPEED_CONFIG       optional path to ZeRO-3 JSON"
+    echo "  REPT_ACCELERATE_CONFIG      optional path to accelerate YAML"
+    echo "  REPT_VLLM_ENABLE_SLEEP_MODE default: 0 (set 1 to sleep vLLM during optimizer step)"
+    echo "  REPT_SAVE_STRATEGY     default: epoch (set no for metric-only runs)"
+    echo "  REPT_SKIP_FINAL_SAVE   default: 0 (set 1 to avoid final checkpoint gather/save)"
+    echo "  REPT_ENV_STEP_ERROR_PENALTY default: -0.4"
     exit 1
 }
 
@@ -84,6 +107,7 @@ if [[ "$REPT_MODEL" != /* ]] && [[ "$REPT_MODEL" != ./* ]]; then
     REPT_MODEL_HUB_ID="$REPT_MODEL"
 fi
 REPT_OUTPUT_DIR="${REPT_OUTPUT_DIR:-${DATA_ROOT}/runs/grpo_train_lambda}"
+REPT_N_PROMPTS="${REPT_N_PROMPTS:-100}"
 REPT_NUM_EPOCHS="${REPT_NUM_EPOCHS:-1}"
 REPT_NUM_GENERATIONS="${REPT_NUM_GENERATIONS:-8}"
 REPT_BATCH_SIZE="${REPT_BATCH_SIZE:-8}"
@@ -94,23 +118,59 @@ if ! [[ "$REPT_VLLM_TP" =~ ^[0-9]+$ ]] || [[ "$REPT_VLLM_TP" -lt 1 ]]; then
     echo "[ERROR] REPT_VLLM_TP must be a positive integer (got: $REPT_VLLM_TP)"
     exit 1
 fi
+REPT_COLOCATE_TRAIN_PROCS="${REPT_COLOCATE_TRAIN_PROCS:-1}"
+if ! [[ "$REPT_COLOCATE_TRAIN_PROCS" =~ ^[0-9]+$ ]] || [[ "$REPT_COLOCATE_TRAIN_PROCS" -lt 1 ]]; then
+    echo "[ERROR] REPT_COLOCATE_TRAIN_PROCS must be a positive integer (got: $REPT_COLOCATE_TRAIN_PROCS)"
+    exit 1
+fi
 REPT_VLLM_GPU_UTIL="${REPT_VLLM_GPU_UTIL:-0.9}"
+REPT_VLLM_EXTRA_ARGS="${REPT_VLLM_EXTRA_ARGS:-}"
 REPT_VLLM_PORT="${REPT_VLLM_PORT:-8001}"
 REPT_VLLM_GROUP_PORT="${REPT_VLLM_GROUP_PORT:-51216}"
 REPT_VLLM_SERVER_HOST="${REPT_VLLM_SERVER_HOST:-127.0.0.1}"
 REPT_VLLM_MODE="${REPT_VLLM_MODE:-auto}"
 REPT_GRADIENT_CHECKPOINTING="${REPT_GRADIENT_CHECKPOINTING:-1}"
 REPT_MAX_COMPLETION_LENGTH="${REPT_MAX_COMPLETION_LENGTH:-4096}"
+REPT_MAX_EPISODE_TURNS="${REPT_MAX_EPISODE_TURNS:-256}"
+REPT_MAX_STEPS="${REPT_MAX_STEPS:-}"
 REPT_NO_BF16="${REPT_NO_BF16:-0}"
 REPT_ALPHA="${REPT_ALPHA:-1.0}"
 REPT_LOG_EVERY="${REPT_LOG_EVERY:-1}"
 REPT_INSTALL_DEPS_ON_RUN="${REPT_INSTALL_DEPS_ON_RUN:-0}"
 REPT_REQUIREMENTS_FILE="${REPT_REQUIREMENTS_FILE:-$REPT_ROOT/requirements.lambda.txt}"
 PYTORCH_WHEEL_INDEX="${PYTORCH_WHEEL_INDEX:-}"
+REPT_MAX_TOKENS_PER_STEP="${REPT_MAX_TOKENS_PER_STEP:-$REPT_MAX_COMPLETION_LENGTH}"
+REPT_DEFAULT_BUDGET_MODE="${REPT_DEFAULT_BUDGET_MODE:-soft}"
+REPT_REWARD_LOG_PATH="${REPT_REWARD_LOG_PATH:-$REPT_OUTPUT_DIR/reward_log.jsonl}"
+REPT_DEBUG_ROLLOUT="${REPT_DEBUG_ROLLOUT:-0}"
+REPT_ROLLOUT_DEBUG_PATH="${REPT_ROLLOUT_DEBUG_PATH:-$REPT_OUTPUT_DIR/rollout_debug.jsonl}"
+# ---- Sharding backend (FSDP / DeepSpeed) ----
+REPT_SHARDING_BACKEND="${REPT_SHARDING_BACKEND:-none}"       # none | fsdp | deepspeed
+REPT_FSDP_SHARDING_STRATEGY="${REPT_FSDP_SHARDING_STRATEGY:-FULL_SHARD}"
+REPT_FSDP_AUTO_WRAP_LAYER="${REPT_FSDP_AUTO_WRAP_LAYER:-Qwen3DecoderLayer}"
+REPT_DEEPSPEED_CONFIG="${REPT_DEEPSPEED_CONFIG:-}"           # path; auto-selects bundled config when empty
+REPT_ACCELERATE_CONFIG="${REPT_ACCELERATE_CONFIG:-}"         # explicit accelerate YAML override
+REPT_VLLM_ENABLE_SLEEP_MODE="${REPT_VLLM_ENABLE_SLEEP_MODE:-0}"
+REPT_SAVE_STRATEGY="${REPT_SAVE_STRATEGY:-epoch}"
+REPT_SKIP_FINAL_SAVE="${REPT_SKIP_FINAL_SAVE:-0}"
+REPT_ENV_STEP_ERROR_PENALTY="${REPT_ENV_STEP_ERROR_PENALTY:--0.4}"
+
+if [[ "$REPT_SHARDING_BACKEND" != "none" && "$REPT_SHARDING_BACKEND" != "fsdp" && \
+      "$REPT_SHARDING_BACKEND" != "deepspeed" ]]; then
+    echo "[ERROR] REPT_SHARDING_BACKEND must be none, fsdp, or deepspeed (got: $REPT_SHARDING_BACKEND)"
+    exit 1
+fi
 
 if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
     if ! [[ "$REPT_VLLM_MAX_MODEL_LEN" =~ ^[0-9]+$ ]] || [[ "$REPT_VLLM_MAX_MODEL_LEN" -lt 1 ]]; then
         echo "[ERROR] REPT_VLLM_MAX_MODEL_LEN must be a positive integer (got: $REPT_VLLM_MAX_MODEL_LEN)"
+        exit 1
+    fi
+fi
+
+if [[ -n "$REPT_MAX_STEPS" ]]; then
+    if ! [[ "$REPT_MAX_STEPS" =~ ^[0-9]+$ ]] || [[ "$REPT_MAX_STEPS" -lt 1 ]]; then
+        echo "[ERROR] REPT_MAX_STEPS must be a positive integer when set (got: $REPT_MAX_STEPS)"
         exit 1
     fi
 fi
@@ -149,7 +209,29 @@ if [[ "$REPT_VLLM_MODE" == "server" ]]; then
         exit 1
     fi
 else
-    TRAIN_PROCS=1
+    TRAIN_PROCS="$REPT_COLOCATE_TRAIN_PROCS"
+    if [[ "$TRAIN_PROCS" -gt "$REPT_NUM_GPUS" ]]; then
+        echo "[ERROR] REPT_COLOCATE_TRAIN_PROCS ($TRAIN_PROCS) exceeds visible GPU count ($REPT_NUM_GPUS)"
+        exit 1
+    fi
+    if [[ "$TRAIN_PROCS" -gt 1 ]]; then
+        echo "  [WARN] Experimental colocate multi-process training: vLLM shares the training GPUs."
+    fi
+fi
+
+if [[ "$REPT_SHARDING_BACKEND" != "none" && "$TRAIN_PROCS" -lt 2 ]]; then
+    echo "[ERROR] REPT_SHARDING_BACKEND=$REPT_SHARDING_BACKEND requires TRAIN_PROCS >= 2 (got: $TRAIN_PROCS)"
+    echo "  Set REPT_COLOCATE_TRAIN_PROCS=2 (colocate mode) or add more GPUs."
+    exit 1
+fi
+
+if [[ "$REPT_SHARDING_BACKEND" != "none" && "$REPT_VLLM_MODE" == "server" ]]; then
+    echo "[INFO] REPT_SHARDING_BACKEND=$REPT_SHARDING_BACKEND with server mode:"
+    echo "  vLLM reserves $REPT_VLLM_TP GPU(s), leaving $TRAIN_PROCS training GPU(s) for sharding."
+    if [[ "$REPT_NUM_GPUS" -le 2 ]]; then
+        echo "  On a 2-GPU box this does not leave enough ranks for useful train-side sharding."
+        echo "  For 2-GPU sharding, use REPT_VLLM_MODE=colocate."
+    fi
 fi
 
 TARGET_EFFECTIVE_PROMPTS=16
@@ -225,7 +307,22 @@ echo "  CUDA avail:      $(python -c 'import torch; print(torch.cuda.is_availabl
 echo "  Model:           $REPT_MODEL"
 echo "  Batch/device:    $REPT_BATCH_SIZE"
 echo "  Num generations: $REPT_NUM_GENERATIONS"
+echo "  Prompts/epoch:   $REPT_N_PROMPTS"
 echo "  Grad accum:      $REPT_GRAD_ACCUM"
+echo "  Max episode turns: $REPT_MAX_EPISODE_TURNS"
+if [[ -n "$REPT_MAX_STEPS" ]]; then
+    echo "  Max steps override: $REPT_MAX_STEPS"
+fi
+echo "  Rollout debug:    $REPT_DEBUG_ROLLOUT"
+if [[ "$REPT_DEBUG_ROLLOUT" == "1" ]]; then
+    echo "  Rollout debug log: $REPT_ROLLOUT_DEBUG_PATH"
+fi
+if [[ -n "$REPT_VLLM_EXTRA_ARGS" ]]; then
+    echo "  vLLM extra args:  $REPT_VLLM_EXTRA_ARGS"
+fi
+echo "  Save strategy:    $REPT_SAVE_STRATEGY"
+echo "  Skip final save:  $REPT_SKIP_FINAL_SAVE"
+echo "  Env-step penalty: $REPT_ENV_STEP_ERROR_PENALTY"
 echo "  Output dir:      $REPT_OUTPUT_DIR"
 echo "  Env URL:         $ENV_BASE_URL"
 if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
@@ -245,9 +342,9 @@ for mod in torch vllm trl transformers datasets huggingface_hub openenv jmespath
     fi
 done
 
-if [[ "$REPT_VLLM_MODE" == "server" ]]; then
+if [[ "$REPT_VLLM_MODE" == "server" || "$TRAIN_PROCS" -gt 1 ]]; then
     if ! command -v accelerate >/dev/null 2>&1; then
-        echo "  [FAIL] accelerate CLI not on PATH (required for vllm_mode=server)"
+        echo "  [FAIL] accelerate CLI not on PATH (required for server mode or multi-process training)"
         exit 1
     fi
     echo "  [PASS] accelerate CLI available"
@@ -293,6 +390,10 @@ if [[ "$REPT_VLLM_MODE" == "server" ]]; then
     VLLM_SERVE_EXTRA=()
     if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
         VLLM_SERVE_EXTRA+=(--max_model_len "$REPT_VLLM_MAX_MODEL_LEN")
+    fi
+    if [[ -n "$REPT_VLLM_EXTRA_ARGS" ]]; then
+        read -r -a _VLLM_EXTRA_FROM_ENV <<< "$REPT_VLLM_EXTRA_ARGS"
+        VLLM_SERVE_EXTRA+=("${_VLLM_EXTRA_FROM_ENV[@]}")
     fi
 
     if [[ $DRY_RUN -eq 0 ]]; then
@@ -354,6 +455,7 @@ COMMON_ARGS=(
     --env_base_url "$ENV_BASE_URL"
     --alpha "$REPT_ALPHA"
     --log_every_n_steps "$REPT_LOG_EVERY"
+    --n_prompts "$REPT_N_PROMPTS"
     --num_train_epochs "$REPT_NUM_EPOCHS"
     --num_generations "$REPT_NUM_GENERATIONS"
     --per_device_train_batch_size "$REPT_BATCH_SIZE"
@@ -365,10 +467,19 @@ COMMON_ARGS=(
     --vllm_server_port "$REPT_VLLM_PORT"
     --vllm_group_port "$REPT_VLLM_GROUP_PORT"
     --max_completion_length "$REPT_MAX_COMPLETION_LENGTH"
+    --max_episode_turns "$REPT_MAX_EPISODE_TURNS"
+    --max_tokens_per_step "$REPT_MAX_TOKENS_PER_STEP"
+    --default_budget_mode "$REPT_DEFAULT_BUDGET_MODE"
     --output_dir "$REPT_OUTPUT_DIR"
+    --reward_log_path "$REPT_REWARD_LOG_PATH"
+    --save_strategy "$REPT_SAVE_STRATEGY"
+    --env_step_error_penalty "$REPT_ENV_STEP_ERROR_PENALTY"
 )
 if [[ -n "$ENV_TOKENIZER_ARG" ]]; then
     COMMON_ARGS+=(--env_tokenizer_name "$ENV_TOKENIZER_ARG")
+fi
+if [[ -n "${REPT_VLLM_MAX_MODEL_LEN:-}" ]]; then
+    COMMON_ARGS+=(--vllm_max_model_len "$REPT_VLLM_MAX_MODEL_LEN")
 fi
 
 if [[ "${REPT_GRADIENT_CHECKPOINTING:-0}" == "1" ]]; then
@@ -379,12 +490,67 @@ if [[ "${REPT_NO_BF16:-0}" == "1" ]]; then
     COMMON_ARGS+=(--no_bf16)
 fi
 
+if [[ "${REPT_DEBUG_ROLLOUT:-0}" == "1" ]]; then
+    COMMON_ARGS+=(--debug_rollout --rollout_debug_path "$REPT_ROLLOUT_DEBUG_PATH")
+fi
+if [[ "${REPT_SKIP_FINAL_SAVE:-0}" == "1" ]]; then
+    COMMON_ARGS+=(--skip_final_save)
+fi
+
+# GRPOTrainer + rollout_func path: TRL wraps the dataset as IterableDataset (no __len__).
+# Transformers Trainer then requires max_steps; compute from n_prompts and batch geometry.
+# prompts_per_step = (batch_size / num_generations) * TRAIN_PROCS
+_PROMPTS_PER_STEP=$(( (REPT_BATCH_SIZE / REPT_NUM_GENERATIONS) * TRAIN_PROCS ))
+if [[ "$_PROMPTS_PER_STEP" -lt 1 ]]; then _PROMPTS_PER_STEP=1; fi
+_STEPS_PER_EPOCH=$(( (REPT_N_PROMPTS + _PROMPTS_PER_STEP - 1) / _PROMPTS_PER_STEP ))
+_MAX_STEPS=$(( _STEPS_PER_EPOCH * REPT_NUM_EPOCHS ))
+if [[ -n "$REPT_MAX_STEPS" ]]; then
+    _MAX_STEPS="$REPT_MAX_STEPS"
+    echo "  Training steps: REPT_MAX_STEPS override → $_MAX_STEPS"
+else
+    echo "  Training steps: n_prompts=$REPT_N_PROMPTS batch=$REPT_BATCH_SIZE gen=$REPT_NUM_GENERATIONS procs=$TRAIN_PROCS → $_MAX_STEPS"
+fi
+COMMON_ARGS+=(--max_steps "$_MAX_STEPS")
+
+if [[ "$REPT_SHARDING_BACKEND" == "fsdp" ]]; then
+    # When FSDP is active, activation_checkpointing in fsdp_config is correct;
+    # gradient_checkpointing in TrainingArguments triggers a redundant AllGather in backward.
+    # See: https://github.com/huggingface/transformers/issues/30404
+    _FSDP_ACT_CKPT="false"
+    if [[ "${REPT_GRADIENT_CHECKPOINTING:-1}" == "1" ]]; then
+        _FSDP_ACT_CKPT="true"
+    fi
+    COMMON_ARGS+=(--fsdp "full_shard auto_wrap")
+    COMMON_ARGS+=(--fsdp_config "{\"fsdp_transformer_layer_cls_to_wrap\":\"${REPT_FSDP_AUTO_WRAP_LAYER}\",\"fsdp_offload_params\":false,\"fsdp_sharding_strategy\":\"${REPT_FSDP_SHARDING_STRATEGY}\",\"activation_checkpointing\":${_FSDP_ACT_CKPT}}")
+elif [[ "$REPT_SHARDING_BACKEND" == "deepspeed" ]]; then
+    _DS_CFG="${REPT_DEEPSPEED_CONFIG:-${REPT_ROOT}/configs/deepspeed/zero3_2x_h100.json}"
+    COMMON_ARGS+=(--deepspeed "$_DS_CFG")
+fi
+
+# Sleep mode is a colocate-only memory feature; ignore for server mode
+if [[ "${REPT_VLLM_ENABLE_SLEEP_MODE:-0}" == "1" && "$REPT_VLLM_MODE" == "colocate" ]]; then
+    COMMON_ARGS+=(--vllm_enable_sleep_mode)
+fi
+
+TRAIN_ENV=()
 if [[ "$REPT_VLLM_MODE" == "server" ]]; then
-    TRAIN_CMD=(
-        env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_DEVS"
-        accelerate launch
+    TRAIN_ENV=(env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_DEVS")
+fi
+
+if [[ "$REPT_VLLM_MODE" == "server" || "$TRAIN_PROCS" -gt 1 ]]; then
+    ACCEL_ARGS=(
         --num_processes "$TRAIN_PROCS"
         --main_process_port "${REPT_ACCELERATE_MAIN_PORT:-29500}"
+    )
+    if [[ -n "$REPT_ACCELERATE_CONFIG" ]]; then
+        ACCEL_ARGS+=(--config_file "$REPT_ACCELERATE_CONFIG")
+    elif [[ "$REPT_SHARDING_BACKEND" == "fsdp" ]]; then
+        ACCEL_ARGS+=(--config_file "${REPT_ROOT}/configs/accelerate/fsdp_2x_h100.yaml")
+    fi
+    TRAIN_CMD=(
+        "${TRAIN_ENV[@]}"
+        accelerate launch
+        "${ACCEL_ARGS[@]}"
         "${COMMON_ARGS[@]}"
     )
 else

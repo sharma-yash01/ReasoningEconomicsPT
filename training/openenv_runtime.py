@@ -9,7 +9,7 @@ from openenv.core.env_client import EnvClient
 
 
 class ReasonBudgetClient(EnvClient):
-    """Dict-in / dict-out OpenEnv client — no domain-specific Pydantic models."""
+    """Dict-in / dict-out OpenEnv client with no domain-specific Pydantic models."""
 
     def _step_payload(self, action: dict) -> dict:
         return action

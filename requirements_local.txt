@@ -1,0 +1,23 @@
+# Local / Apple Silicon requirements (no vLLM, no CUDA)
+# Use with: pip install -r requirements_local.txt
+
+# ---- Core training stack ----
+openenv-core[core]==0.2.*
+trl==1.0.0
+transformers>=5.2.0
+datasets>=2.21
+accelerate>=1.2
+peft>=0.13
+
+# ---- Deep learning runtime ----
+# Install torch with MPS support (standard from pytorch.org for macOS):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# or just:
+#   pip install torch
+torch>=2.0.0
+torchvision
+numpy==1.26.*
+
+# ---- Data / config ----
+pydantic==2.10.*
+jmespath

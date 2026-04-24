@@ -29,6 +29,7 @@ fi
 REPT_OUTPUT_DIR="${REPT_OUTPUT_DIR:-${DATA_ROOT}/runs/grpo_train_lambda}"
 
 echo "=== Lambda Preflight Checks ==="
+echo "  Architecture: $(uname -m)"
 echo ""
 
 echo "--- Required environment variables ---"
