@@ -11,7 +11,7 @@ class TrainingRuntimeConfig:
     """Runtime controls used by training/grpo_train.py (rollout_func path)."""
 
     # Reward weighting (total signal path for now).
-    alpha: float = 1.0
+    alpha: float = 0.8
     beta: float = 0.0  # reserved for future reward shaping
 
     # Per-turn vLLM cap in rollout_func; also clipped by ``GRPOConfig.max_completion_length``.
@@ -25,7 +25,7 @@ class TrainingRuntimeConfig:
 
     # Reward logging controls.
     log_rewards: bool = True
-    log_every_n_steps: int = 1
+    log_every_n_steps: int = 2
     reward_log_path: str = ""
 
     def normalized_default_mode(self):
