@@ -2,59 +2,6 @@
 
 Post-training code for LLM/LRMs against the deployed `ReasoningEconomicsEnv` OpenEnv environment.
 
-## Submitted branch
-
-ReasoningEconomicsPT branch: `deepseed-harshawn`
-https://github.com/sharma-yash01/ReasoningEconomicsPT/tree/deepseed-harshawn
-
-This branch adds the training code and Lambda scripts used for the Qwen3-14B
-GRPO run. The trainer now runs full OpenEnv episodes with explicit `reset` /
-`step` calls, handles Qwen3 answer parsing, writes reward/debug JSONL logs,
-supports server-mode vLLM, and includes DeepSpeed configs for A100/H100 runs.
-
-Key scripts:
-
-- `scripts/bootstrap_lambda.sh`
-- `scripts/preflight_lambda.sh`
-- `scripts/run_grpo_lambda.sh`
-- `scripts/smoke_episode_cpu.sh`
-- `scripts/smoke_episode_lambda.sh`
-
-The main 14B run used Lambda Labs 8x A100. Six GPUs were used for GRPO training
-and two GPUs were used for `trl vllm-serve`. Small smoke tests can run on
-smaller hardware, but positive 14B training results need multiple 80 GB GPUs,
-at least A100 class.
-
-Main run:
-
-```bash
-cd ReasoningEconomicsPT
-
-export REPT_ROOT="$PWD"
-export REPT_VENV="/home/ubuntu/rept-venv"
-export REPT_DATA_ROOT="/lambda/nfs/csci-544/rept"
-export ENV_BASE_URL="http://127.0.0.1:8000"
-
-export REPT_MODEL=Qwen/Qwen3-14B
-export REPT_NUM_GPUS=8
-export REPT_VLLM_MODE=server
-export REPT_VLLM_TP=2
-export REPT_SHARDING_BACKEND=deepspeed
-export REPT_DEEPSPEED_CONFIG="$REPT_ROOT/configs/deepspeed/zero3_8x_a100_40gb_offload_optimizer.json"
-
-bash scripts/bootstrap_lambda.sh
-bash scripts/preflight_lambda.sh
-bash scripts/run_grpo_lambda.sh --dry-run
-bash scripts/run_grpo_lambda.sh
-```
-
-Results are generated from:
-
-- `reward_log.jsonl`
-- `rollout_debug.jsonl`
-- `vllm_serve.log`
-- trainer metrics/checkpoint files in `REPT_OUTPUT_DIR`
-
 ## Install
 
 Install core training dependencies:
