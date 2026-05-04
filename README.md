@@ -23,6 +23,30 @@ changes are:
 The companion `ReasoningEconomicsEnv` directory contains the OpenEnv server and
 reward implementation used by these rollouts.
 
+## Submission links and hardware
+
+Public code branches:
+
+- `ReasoningEconomicsPT`: `https://github.com/sharma-yash01/ReasoningEconomicsPT/tree/deepseed-harshawn`
+- `ReasoningEconomicsEnv`: `https://github.com/sharma-yash01/ReasoningEconomicsEnv/tree/deepseed-harshawn`
+
+System used for the main run:
+
+- Lambda Labs GPU VM with 8 A100 GPUs.
+- Qwen3-14B used six GPUs for GRPO training and two GPUs for `trl vllm-serve`.
+- The OpenEnv server ran locally beside training on the same VM.
+
+Small smoke runs can be used to check that the code starts, but positive
+training results for the 14B setup require multiple 80 GB GPUs, at least A100
+class. The 8x A100 40 GB run reached optimizer steps and partial positive
+episode rewards, but the larger positive-result setup should be planned around
+80 GB A100 or stronger GPUs because GRPO keeps both training and generation
+memory pressure high.
+
+Results are generated from `reward_log.jsonl`, `rollout_debug.jsonl`, trainer
+metrics, and the vLLM server log. The 8x A100 recipe below shows the exact
+variables used for the 14B run and the log paths to inspect.
+
 ## Install
 
 Install core training dependencies:
