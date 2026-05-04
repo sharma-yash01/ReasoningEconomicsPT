@@ -2,6 +2,27 @@
 
 Post-training code for LLM/LRMs against the deployed `ReasoningEconomicsEnv` OpenEnv environment.
 
+## Submitted branch
+
+Our submitted training branch is `deepseed-harshawn`:
+`https://github.com/sharma-yash01/ReasoningEconomicsPT/tree/deepseed-harshawn`
+
+That branch has the Qwen3-14B OpenEnv rollout trainer, DeepSpeed configs, and
+Lambda scripts used for the A100 run. To run it, start the matching
+`ReasoningEconomicsEnv` branch first, then run:
+
+```bash
+bash scripts/bootstrap_lambda.sh
+bash scripts/preflight_lambda.sh
+bash scripts/run_grpo_lambda.sh --dry-run
+bash scripts/run_grpo_lambda.sh
+```
+
+The main 14B run used Lambda Labs 8x A100. Small smoke runs can check the code
+path, but positive 14B training results need multiple 80 GB GPUs, at least A100
+class. Results are read from `reward_log.jsonl`, `rollout_debug.jsonl`, trainer
+metrics, and `vllm_serve.log`.
+
 ## Install
 
 Install core training dependencies:
