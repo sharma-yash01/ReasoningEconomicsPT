@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 ENV_BASE_URL: str = ""
 RUNTIME_CFG: TrainingRuntimeConfig | None = None
 REWARD_LOG_PATH: str = ""
+ROLLOUT_LOG_PATH: str = ""
 EPISODE_LOG_COUNT: int = 0
 LOG_LOCK = threading.Lock()
 
@@ -50,6 +51,18 @@ LOG_PREVIEW_CHARS = 2000
 # TRL vLLM server mode calls NCCL collectives inside each generate(); keep call counts
 # identical across ranks (see impl-context/dist-train-issue-hung-gpu.md).
 DIST_SERVER_GENERATES_PER_EPISODE = 8
+
+
+def _write_rollout_member_log(record: dict) -> None:
+    """Unthrottled per-group-member JSONL for the audit detector."""
+    if not ROLLOUT_LOG_PATH:
+        return
+    try:
+        from audit.stagec.rollout_log import write_rollout_member_log
+
+        write_rollout_member_log(ROLLOUT_LOG_PATH, record)
+    except Exception as exc:  # noqa: BLE001
+        print(f"rollout member log failed: {exc}")
 
 
 def _truncate_for_log(s: str, max_len: int = LOG_PREVIEW_CHARS) -> str:
@@ -494,7 +507,61 @@ def _rollout_one_episode(
             env_mask.extend([0] * len(suffix))
             logprob_seq.extend([0.0] * len(suffix))
 
-        return prompt_ids_fixed, completion_ids, logprob_seq, env_mask, float(session.reward), turns
+        # Build audit meta for unthrottled member logs.
+        history = []
+        final_obs = session._obs or {}
+        if isinstance(final_obs, dict):
+            history = list(final_obs.get("history") or [])
+        total_budget = int((final_obs.get("metadata") or {}).get("total_budget") or env_total_budget or 8100)
+        num_questions = int((final_obs.get("metadata") or {}).get("num_questions") or max(1, len(history)))
+        accuracy_component = 0.0
+        cost_component = 0.0
+        episode_component = 0.0
+        try:
+            from audit.envs.breakdown import breakdown_reasoning_step
+
+            for i, entry in enumerate(history):
+                is_final = i == len(history) - 1
+                total_correct = sum(1 for h in history[: i + 1] if h.get("was_correct"))
+                total_spent = sum(int(h.get("tokens_used", 0)) for h in history[: i + 1])
+                # Probe formula with a dummy reward equal to the sum of components after first call.
+                br_probe = breakdown_reasoning_step(
+                    reward=0.0,
+                    history_entry=entry,
+                    total_budget=total_budget,
+                    num_questions=num_questions,
+                    is_final_scored_step=is_final,
+                    total_correct=total_correct,
+                    total_spent=total_spent,
+                )
+                # Reconstruct pre-residual formula from native keys.
+                acc_i = float(br_probe.get("correctness", br_probe["accuracy_component"]))
+                cost_i = (
+                    -float(br_probe.get("cost_penalty", 0.0))
+                    + float(br_probe.get("efficiency_bonus", 0.0))
+                    - float(br_probe.get("overspend_penalty", 0.0))
+                )
+                ep_i = float(br_probe.get("episode_bonus", 0.0))
+                accuracy_component += acc_i
+                cost_component += cost_i
+                episode_component += ep_i
+            del breakdown_reasoning_step
+        except Exception:
+            accuracy_component = float(session.reward)
+        last_text = ""
+        if session.step_logs:
+            last_text = str(session.step_logs[-1].get("model_response") or "")
+        action_type = "answer" if "\\boxed{" in last_text else "prose"
+        parse_valid = bool("\\boxed{" in last_text)
+        meta = {
+            "episode_length": len(session.step_logs),
+            "action_type": action_type,
+            "parse_valid": parse_valid,
+            "accuracy_component": accuracy_component,
+            "cost_component": cost_component,
+            "episode_component": episode_component,
+        }
+        return prompt_ids_fixed, completion_ids, logprob_seq, env_mask, float(session.reward), turns, meta
 
 
 # ---------------------------------------------------------------------------
@@ -556,8 +623,10 @@ def build_rollout_func(
         all_env_mask: list[list[int]] = []
         all_env_reward: list[float] = []
 
-        for seed_messages in prompts:
-            p, c, lp, m, r, n_gen = _rollout_one_episode(
+        g = int(getattr(trainer.args, "num_generations", 8) or 8)
+        step = int(getattr(getattr(trainer, "state", None), "global_step", 0) or 0)
+        for i, seed_messages in enumerate(prompts):
+            p, c, lp, m, r, n_gen, meta = _rollout_one_episode(
                 seed_messages,
                 trainer,
                 tok=tok,
@@ -582,6 +651,25 @@ def build_rollout_func(
             all_logprobs.append(lp)
             all_env_mask.append(m)
             all_env_reward.append(r)
+            try:
+                completion_text = tok.decode(c, skip_special_tokens=True)
+            except Exception:
+                completion_text = ""
+            _write_rollout_member_log(
+                {
+                    "step": step,
+                    "group_idx": i // max(1, g),
+                    "member_idx": i % max(1, g),
+                    "reward": float(r),
+                    "accuracy_component": float(meta.get("accuracy_component", 0.0)),
+                    "cost_component": float(meta.get("cost_component", 0.0)),
+                    "episode_component": float(meta.get("episode_component", 0.0)),
+                    "completion": completion_text,
+                    "episode_length": int(meta.get("episode_length", 0)),
+                    "action_type": meta.get("action_type", "prose"),
+                    "parse_valid": bool(meta.get("parse_valid", True)),
+                }
+            )
 
         return {
             "prompt_ids": all_prompt_ids,
@@ -613,7 +701,7 @@ def reward_from_env(prompts, completions, completion_ids, **kwargs):
 
 
 def main():
-    global ENV_BASE_URL, RUNTIME_CFG, REWARD_LOG_PATH
+    global ENV_BASE_URL, RUNTIME_CFG, REWARD_LOG_PATH, ROLLOUT_LOG_PATH
 
     parser = argparse.ArgumentParser(description="GRPO training against remote OpenEnv env")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B")
@@ -632,6 +720,12 @@ def main():
     parser.add_argument("--no_log_rewards", action="store_true")
     parser.add_argument("--log_every_n_steps", type=int, default=1)
     parser.add_argument("--reward_log_path", type=str, default="")
+    parser.add_argument(
+        "--rollout_log_path",
+        type=str,
+        default="",
+        help="Unthrottled per-group-member JSONL for audit detector (results/rollouts/).",
+    )
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--vllm_mode", type=str, default="colocate", choices=["colocate", "server"])
@@ -742,8 +836,11 @@ def main():
         strict_budget_mode_metadata=args.strict_budget_mode_metadata,
     )
     REWARD_LOG_PATH = RUNTIME_CFG.resolved_reward_log_path(args.output_dir)
+    ROLLOUT_LOG_PATH = str(args.rollout_log_path or "")
     if RUNTIME_CFG.log_rewards:
         print(f"Reward episode logs: {REWARD_LOG_PATH} (every {RUNTIME_CFG.log_every_n_steps} episodes)")
+    if ROLLOUT_LOG_PATH:
+        print(f"Audit rollout member logs (unthrottled): {ROLLOUT_LOG_PATH}")
 
     profiles_path = Path(args.model_profiles_path) if args.model_profiles_path else None
     profile_registry = load_profiles(profiles_path)
